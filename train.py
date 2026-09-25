@@ -147,10 +147,9 @@ class BestValLossReporter(Callback):
             except Exception as e:  # noqa: BLE001 - reporting must not break training
                 print(f"[report] skipped Excel workbook generation: {e}")
 
-from Models import VAE, TiltedVAE, Backbone
-from dataset import (VAEDataModule, ContrastiveDataModule, InatDataModule,
+from Models import Backbone
+from dataset import (ContrastiveDataModule, InatDataModule,
                      FGVCAircraftDataModule)
-from experiment import VAEExperiment
 from contrastive_experiment import ContrastiveExperiment
 
 # Use file-system based tensor sharing to avoid /dev/shm exhaustion, which
@@ -160,7 +159,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Convolutional VAE with PyTorch Lightning + W&B")
+    parser = argparse.ArgumentParser(description="Train a contrastive backbone with PyTorch Lightning + W&B")
 
     # Data
     parser.add_argument("--dataset", type=str, default="myzus",
@@ -199,34 +198,18 @@ def parse_args() -> argparse.Namespace:
                         help="FGVC-Aircraft split used for evaluation")
     parser.add_argument("--aircraft_download", action="store_true",
                         help="Download the FGVC-Aircraft archive if it is missing")
-    parser.add_argument("--data_dir", type=str, default=None,
-                        help="Path to the image dataset (any nested folder layout). "
-                             "Required for the VAE models; ignored for --model backbone, "
-                             "which uses --contrastive_metadata instead.")
     parser.add_argument("--img_size", type=int, default=96, help="Square image size")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=12)
     parser.add_argument("--val_split", type=float, default=0.1)
-    parser.add_argument("--index_cache", type=str, default=None,
-                        help="Optional .npy path to cache the scanned image list "
-                             "(avoids re-walking huge datasets each run)")
-    parser.add_argument("--max_val_samples", type=int, default=None,
-                        help="Cap the validation subset size (e.g. 20000) to keep "
-                             "validation fast on very large datasets")
 
     # Model
-    parser.add_argument("--model", type=str, default="vae",
-                        choices=["vae", "tilted", "backbone"],
-                        help="Which model to train: 'vae' (standard VAE), "
-                             "'tilted' (TiltedVAE with an exponentially tilted prior), "
-                             "or 'backbone' (a fully fine-tuned backbone trained with "
-                             "supervised contrastive losses; pick the "
-                             "architecture with --backbone)")
+    parser.add_argument("--model", type=str, default="backbone",
+                        choices=["backbone"],
+                        help="Which model to train: 'backbone' (a fully fine-tuned "
+                             "backbone trained with supervised contrastive losses; "
+                             "pick the architecture with --backbone)")
     parser.add_argument("--in_channels", type=int, default=3)
-    parser.add_argument("--latent_dim", type=int, default=128)
-    parser.add_argument("--tau", type=float, default=None,
-                        help="Tilt parameter for the TiltedVAE prior (only used when "
-                             "--model tilted). Defaults to sqrt(2 * latent_dim)")
 
     # Contrastive model (only used when --model backbone)
     parser.add_argument("--backbone", type=str, default="resnet18",
@@ -424,16 +407,6 @@ def parse_args() -> argparse.Namespace:
     # Optimization
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--kld_weight", type=float, default=0.005,
-                        help="Weight for the KL term (M_N); ~ batch_size / dataset_size")
-    parser.add_argument("--anneal_kld", action="store_true",
-                        help="Enable sigmoid annealing of the KL weight over training steps")
-    parser.add_argument("--anneal_k", type=float, default=0.0025,
-                        help="Steepness of the sigmoid KL annealing schedule")
-    parser.add_argument("--anneal_x0", type=int, default=2500,
-                        help="Global step at which the sigmoid schedule reaches its midpoint")
-    parser.add_argument("--au_threshold", type=float, default=0.01,
-                        help="Posterior-mean variance threshold for counting active units (AU)")
     parser.add_argument("--scheduler_gamma", type=float, default=0.95)
     parser.add_argument("--scheduler", type=str, default="exponential",
                         choices=["exponential", "cosine"],
@@ -459,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
 
     # Logging / checkpoints
-    parser.add_argument("--project", type=str, default="tilted-vae-myzus",
+    parser.add_argument("--project", type=str, default="hierarchy-prototype-attention",
                         help="W&B project name")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name")
     parser.add_argument("--entity", type=str, default="fm_val",
@@ -500,8 +473,6 @@ def main() -> None:
     if not args.deterministic:
         torch.backends.cudnn.benchmark = True
 
-    is_contrastive = args.model == "backbone"
-
     if args.taxocon_aug and args.supcon_soft_pos_loss:
         raise ValueError(
             "--taxocon_aug and --supcon_soft_pos_loss are mutually exclusive: "
@@ -517,281 +488,237 @@ def main() -> None:
     # BuCSFR needs the dataset index to look up each sample's dendrogram cluster.
     grafit_bank = (args.grafit and args.grafit_bank) or args.bucsfr
 
-    if is_contrastive:
-        args.in_channels = 3
+    args.in_channels = 3
 
-        if args.dataset == "inat":
-            # iNaturalist 2021 dataset
-            datamodule = InatDataModule(
-                train_metadata=args.inat_train_metadata,
-                val_metadata=args.inat_val_metadata,
-                train_image_dir=args.inat_train_dir,
-                val_image_dir=args.inat_val_dir,
-                train_cat=args.train_cat,
-                test_cat=args.test_cat,
-                img_size=args.img_size,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                classes_per_batch=args.contrastive_classes_per_batch,
-                samples_per_class=args.contrastive_samples_per_class,
-                superclass=args.superclass,
-                grafit_views=grafit_views,
-                grafit_bank=grafit_bank,
-                seed=args.seed,
-            )
-        elif args.dataset == "aircraft":
-            # FGVC-Aircraft (manufacturer / family / variant hierarchy)
-            datamodule = FGVCAircraftDataModule(
-                root=args.aircraft_root,
-                train_split=args.aircraft_train_split,
-                val_split=args.aircraft_val_split,
-                train_cat=args.train_cat,
-                test_cat=args.test_cat,
-                img_size=args.img_size,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                classes_per_batch=args.contrastive_classes_per_batch,
-                samples_per_class=args.contrastive_samples_per_class,
-                download=args.aircraft_download,
-                grafit_views=grafit_views,
-                grafit_bank=grafit_bank,
-                seed=args.seed,
-            )
-        else:
-            # Myzus (default) dataset
-            missing = [name for name, val in (
-                ("--contrastive_metadata", args.contrastive_metadata),
-                ("--contrastive_labels", args.contrastive_labels),
-                ("--contrastive_root_dir", args.contrastive_root_dir),
-            ) if not val]
-            if missing:
-                raise ValueError(
-                    f"--model backbone requires {', '.join(missing)} to build the "
-                    "synthesis-program-labelled contrastive dataset."
-                )
-
-            datamodule = ContrastiveDataModule(
-                image_metadata_json=args.contrastive_metadata,
-                label_metadata_csv=args.contrastive_labels,
-                root_dir=args.contrastive_root_dir,
-                img_size=args.img_size,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                val_split=args.val_split,
-                compound_col=args.contrastive_compound_col,
-                label_col=args.contrastive_label_col,
-                min_compounds_per_class=args.contrastive_min_per_class,
-                filter_by_efficacy=args.contrastive_filter_efficacy,
-                use_control=args.contrastive_use_control,
-                classes_per_batch=args.contrastive_classes_per_batch,
-                samples_per_class=args.contrastive_samples_per_class,
-                compound_level=args.compound_level,
-                grafit_views=grafit_views,
-                grafit_bank=grafit_bank,
-                seed=args.seed,
-            )
-
-        # The cross-entropy baseline needs the number of training-label classes
-        # up front to size its linear classifier head, and Grafit's memory bank
-        # needs one slot per training image. setup() is idempotent; Lightning
-        # calls it again internally during fit().
-        num_classes = None
-        grafit_bank_size = 0
-        if args.cross_entropy or grafit_bank:
-            datamodule.setup()
-            grafit_bank_size = (len(datamodule.train_dataset)
-                                if (args.grafit and args.grafit_bank) else 0)
-        if args.cross_entropy or args.bucsfr:
-            num_classes = (datamodule.num_train_classes
-                           if args.dataset in ("inat", "aircraft")
-                           else datamodule.num_classes)
-
-        model = Backbone(
-            backbone=args.backbone,
-            img_size=args.img_size,
-            embedding_dim=args.embedding_dim,
-            proj_hidden_dim=args.proj_hidden_dim,
-            temperature=args.temperature,
-            use_proj_head=args.use_proj_head,
-            supcon_soft_pos=args.supcon_soft_pos_loss,
-            supcon_soft_pos_tau=args.supcon_soft_pos_tau,
-            supcon_denom_pos_weight=args.denominator_pos_weight,
-            taxocon_aug=args.taxocon_aug,
-            sinkhorn=args.sinkhorn,
-            sinkhorn_iters=args.sinkhorn_iters,
-            grad_checkpointing=args.grad_checkpointing,
-            num_classes=num_classes,
-            cross_entropy=args.cross_entropy or args.bucsfr,
-            grafit_predictor=use_instance_term,
-        )
-
-        experiment = ContrastiveExperiment(
-            model=model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            temperature=args.temperature,
-            scheduler_gamma=args.scheduler_gamma,
-            scheduler=args.scheduler,
-            warmup_epochs=args.warmup_epochs,
-            max_epochs=args.epochs,
-            vanilla_supcon=args.vanilla_supcon,
-            ms_loss=args.ms_loss,
-            ms_thresh=args.ms_thresh,
-            ms_margin=args.ms_margin,
-            ms_scale_pos=args.ms_scale_pos,
-            ms_scale_neg=args.ms_scale_neg,
-            grafit=args.grafit,
-            grafit_lam=args.grafit_lam,
-            grafit_bank_size=grafit_bank_size,
-            maskcon=args.maskcon,
-            maskcon_w=args.maskcon_w,
-            maskcon_soft_temperature=args.maskcon_soft_tau,
-            maskcon_queue_size=args.maskcon_queue_size,
-            bucsfr=args.bucsfr,
-            bucsfr_alpha=args.bucsfr_alpha,
-            bucsfr_queue_size=args.bucsfr_queue_size,
-            bucsfr_clusters_per_class=args.bucsfr_clusters_per_class,
-            bucsfr_threshold=args.bucsfr_threshold,
-            bucsfr_warmup_epochs=args.bucsfr_warmup_epochs,
-            bucsfr_refresh_every=args.bucsfr_refresh_every,
-            supcon_softpos=args.supcon_soft_pos_loss,
-            supcon_inst=supcon_inst,
-            supcon_inst_weight=args.supcon_inst_weight,
-            taxocon_aug=args.taxocon_aug,
-            cross_entropy=args.cross_entropy,
-            supcon_soft_pos_tau=args.supcon_soft_pos_tau,
-            denom_pos_weight=args.denominator_pos_weight,
-            tau_annealing=args.tau_annealing,
-            supcon_tau_start=args.supcon_tau_start,
-            supcon_tau_end=args.supcon_tau_end,
-            no_pos_weight_epoch=args.no_pos_weight_epoch,
-            sinkhorn=args.sinkhorn,
-            sinkhorn_iters=args.sinkhorn_iters,
-            EMA_pos_weight=args.EMA_pos_weight,
-            EMA_momentum=args.EMA_momentum,
+    if args.dataset == "inat":
+        # iNaturalist 2021 dataset
+        datamodule = InatDataModule(
+            train_metadata=args.inat_train_metadata,
+            val_metadata=args.inat_val_metadata,
+            train_image_dir=args.inat_train_dir,
+            val_image_dir=args.inat_val_dir,
             train_cat=args.train_cat,
-            test_cats=args.test_cat,
+            test_cat=args.test_cat,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            classes_per_batch=args.contrastive_classes_per_batch,
+            samples_per_class=args.contrastive_samples_per_class,
+            superclass=args.superclass,
+            grafit_views=grafit_views,
+            grafit_bank=grafit_bank,
+            seed=args.seed,
+        )
+    elif args.dataset == "aircraft":
+        # FGVC-Aircraft (manufacturer / family / variant hierarchy)
+        datamodule = FGVCAircraftDataModule(
+            root=args.aircraft_root,
+            train_split=args.aircraft_train_split,
+            val_split=args.aircraft_val_split,
+            train_cat=args.train_cat,
+            test_cat=args.test_cat,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            classes_per_batch=args.contrastive_classes_per_batch,
+            samples_per_class=args.contrastive_samples_per_class,
+            download=args.aircraft_download,
+            grafit_views=grafit_views,
+            grafit_bank=grafit_bank,
+            seed=args.seed,
         )
     else:
-        if not args.data_dir:
-            raise ValueError(f"--data_dir is required for --model {args.model}.")
-        # Data
-        datamodule = VAEDataModule(
-            data_dir=args.data_dir,
+        # Myzus (default) dataset
+        missing = [name for name, val in (
+            ("--contrastive_metadata", args.contrastive_metadata),
+            ("--contrastive_labels", args.contrastive_labels),
+            ("--contrastive_root_dir", args.contrastive_root_dir),
+        ) if not val]
+        if missing:
+            raise ValueError(
+                f"--model backbone requires {', '.join(missing)} to build the "
+                "synthesis-program-labelled contrastive dataset."
+            )
+
+        datamodule = ContrastiveDataModule(
+            image_metadata_json=args.contrastive_metadata,
+            label_metadata_csv=args.contrastive_labels,
+            root_dir=args.contrastive_root_dir,
             img_size=args.img_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             val_split=args.val_split,
-            index_cache=args.index_cache,
-            max_val_samples=args.max_val_samples,
+            compound_col=args.contrastive_compound_col,
+            label_col=args.contrastive_label_col,
+            min_compounds_per_class=args.contrastive_min_per_class,
+            filter_by_efficacy=args.contrastive_filter_efficacy,
+            use_control=args.contrastive_use_control,
+            classes_per_batch=args.contrastive_classes_per_batch,
+            samples_per_class=args.contrastive_samples_per_class,
+            compound_level=args.compound_level,
+            grafit_views=grafit_views,
+            grafit_bank=grafit_bank,
+            seed=args.seed,
         )
 
-        # Model
-        if args.model == "tilted":
-            model = TiltedVAE(
-                in_channels=args.in_channels,
-                latent_dim=args.latent_dim,
-                tau=args.tau,
-                img_size=args.img_size,
-            )
-        else:
-            model = VAE(
-                in_channels=args.in_channels,
-                latent_dim=args.latent_dim,
-                img_size=args.img_size,
-            )
+    # The cross-entropy baseline needs the number of training-label classes
+    # up front to size its linear classifier head, and Grafit's memory bank
+    # needs one slot per training image. setup() is idempotent; Lightning
+    # calls it again internally during fit().
+    num_classes = None
+    grafit_bank_size = 0
+    if args.cross_entropy or grafit_bank:
+        datamodule.setup()
+        grafit_bank_size = (len(datamodule.train_dataset)
+                            if (args.grafit and args.grafit_bank) else 0)
+    if args.cross_entropy or args.bucsfr:
+        num_classes = (datamodule.num_train_classes
+                       if args.dataset in ("inat", "aircraft")
+                       else datamodule.num_classes)
 
-        experiment = VAEExperiment(
-            model=model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            kld_weight=args.kld_weight,
-            scheduler_gamma=args.scheduler_gamma,
-            anneal_kld=args.anneal_kld,
-            anneal_k=args.anneal_k,
-            anneal_x0=args.anneal_x0,
-            au_threshold=args.au_threshold,
-        )
+    model = Backbone(
+        backbone=args.backbone,
+        img_size=args.img_size,
+        embedding_dim=args.embedding_dim,
+        proj_hidden_dim=args.proj_hidden_dim,
+        temperature=args.temperature,
+        use_proj_head=args.use_proj_head,
+        supcon_soft_pos=args.supcon_soft_pos_loss,
+        supcon_soft_pos_tau=args.supcon_soft_pos_tau,
+        supcon_denom_pos_weight=args.denominator_pos_weight,
+        taxocon_aug=args.taxocon_aug,
+        sinkhorn=args.sinkhorn,
+        sinkhorn_iters=args.sinkhorn_iters,
+        grad_checkpointing=args.grad_checkpointing,
+        num_classes=num_classes,
+        cross_entropy=args.cross_entropy or args.bucsfr,
+        grafit_predictor=use_instance_term,
+    )
+
+    experiment = ContrastiveExperiment(
+        model=model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        temperature=args.temperature,
+        scheduler_gamma=args.scheduler_gamma,
+        scheduler=args.scheduler,
+        warmup_epochs=args.warmup_epochs,
+        max_epochs=args.epochs,
+        vanilla_supcon=args.vanilla_supcon,
+        ms_loss=args.ms_loss,
+        ms_thresh=args.ms_thresh,
+        ms_margin=args.ms_margin,
+        ms_scale_pos=args.ms_scale_pos,
+        ms_scale_neg=args.ms_scale_neg,
+        grafit=args.grafit,
+        grafit_lam=args.grafit_lam,
+        grafit_bank_size=grafit_bank_size,
+        maskcon=args.maskcon,
+        maskcon_w=args.maskcon_w,
+        maskcon_soft_temperature=args.maskcon_soft_tau,
+        maskcon_queue_size=args.maskcon_queue_size,
+        bucsfr=args.bucsfr,
+        bucsfr_alpha=args.bucsfr_alpha,
+        bucsfr_queue_size=args.bucsfr_queue_size,
+        bucsfr_clusters_per_class=args.bucsfr_clusters_per_class,
+        bucsfr_threshold=args.bucsfr_threshold,
+        bucsfr_warmup_epochs=args.bucsfr_warmup_epochs,
+        bucsfr_refresh_every=args.bucsfr_refresh_every,
+        supcon_softpos=args.supcon_soft_pos_loss,
+        supcon_inst=supcon_inst,
+        supcon_inst_weight=args.supcon_inst_weight,
+        taxocon_aug=args.taxocon_aug,
+        cross_entropy=args.cross_entropy,
+        supcon_soft_pos_tau=args.supcon_soft_pos_tau,
+        denom_pos_weight=args.denominator_pos_weight,
+        tau_annealing=args.tau_annealing,
+        supcon_tau_start=args.supcon_tau_start,
+        supcon_tau_end=args.supcon_tau_end,
+        no_pos_weight_epoch=args.no_pos_weight_epoch,
+        sinkhorn=args.sinkhorn,
+        sinkhorn_iters=args.sinkhorn_iters,
+        EMA_pos_weight=args.EMA_pos_weight,
+        EMA_momentum=args.EMA_momentum,
+        train_cat=args.train_cat,
+        test_cats=args.test_cat,
+    )
 
     # Build checkpoint suffix (also used as default W&B run name).
-    if is_contrastive:
-        proj_tag = "Proj" if args.use_proj_head else "NoProj"
-        p_val = args.contrastive_classes_per_batch
-        k_val = args.contrastive_samples_per_class
-        level_tag = "_Comp" if args.compound_level else ""
-        test_cat_tag = "-".join(args.test_cat)
-        dataset_tag = ""
-        if args.dataset == "inat":
-            dataset_tag = f"_inat_{args.train_cat}->{test_cat_tag}"
-            if args.superclass:
-                dataset_tag += f"_{args.superclass}"
-        elif args.dataset == "aircraft":
-            dataset_tag = f"_aircraft_{args.train_cat}->{test_cat_tag}"
-        # "FFT" = full fine-tuning; short per-architecture tag.
-        backbone_tag = {
-            "resnet18": "ResNet18",
-            "resnet50": "ResNet50",
-            "vit_small_patch16_224": "ViTs16",
-            "swin_tiny_patch4_window7_224": "SwinT",
-            "convnext_tiny": "ConvNeXtT",
-        }.get(args.backbone, args.backbone)
-        model_prefix = f"FFT_{backbone_tag}"
-        ema_pw_tag = f"-EMA{args.EMA_momentum}" if args.EMA_pos_weight else ""
-        vanilla_supcon_tag = "_VanillaSupCon" if args.vanilla_supcon else ""
-        ms_loss_tag = (
-            f"_MS-L{args.ms_thresh}-M{args.ms_margin}"
-            f"-A{args.ms_scale_pos}-B{args.ms_scale_neg}"
-        ) if args.ms_loss else ""
-        cross_entropy_tag = "_CrossEntropy" if args.cross_entropy else ""
-        grafit_tag = (
-            f"_Grafit-Lam{args.grafit_lam}-Views{args.grafit_views}"
-            f"{'-Bank' if args.grafit_bank else ''}"
-        ) if args.grafit else ""
-        maskcon_tag = (
-            f"_MaskCon-W{args.maskcon_w}-T0{args.maskcon_soft_tau}"
-            f"-Q{args.maskcon_queue_size}-Views{args.grafit_views}"
-            f"-M{args.EMA_momentum}"
-        ) if args.maskcon else ""
-        bucsfr_tag = (
-            f"_BuCSFR-A{args.bucsfr_alpha}-C{args.bucsfr_clusters_per_class}"
-            f"-T{args.bucsfr_threshold}-W{args.bucsfr_warmup_epochs}"
-            f"-Q{args.bucsfr_queue_size}-Views{args.grafit_views}"
-            f"-M{args.EMA_momentum}"
-        ) if args.bucsfr else ""
-        supcon_softpos_tag = (
-            f"_SupConSoftPos-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
-            f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
-            f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
-            f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
-            f"{'-Inst' + str(args.supcon_inst_weight) + 'Views' + str(args.grafit_views) if args.supcon_inst else ''}"
-            f"{ema_pw_tag}"
-        ) if args.supcon_soft_pos_loss else ""
-        taxocon_aug_tag = (
-            f"_TaxoConAug-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
-            f"-Views{args.grafit_views}"
-            f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
-            f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
-            f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
-            f"{ema_pw_tag}"
-        ) if args.taxocon_aug else ""
-        ckpt_suffix = (
-            f"{model_prefix}"
-            f"_P{p_val}_K{k_val}_BS{args.batch_size}"
-            f"_{proj_tag}"
-            f"_T{args.temperature}"
-            f"{level_tag}"
-            f"{vanilla_supcon_tag}"
-            f"{ms_loss_tag}"
-            f"{grafit_tag}"
-            f"{maskcon_tag}"
-            f"{bucsfr_tag}"
-            f"{cross_entropy_tag}"
-            f"{supcon_softpos_tag}"
-            f"{taxocon_aug_tag}"
-            f"{dataset_tag}"
-        )
-    else:
-        ckpt_suffix = f"{args.model}-latent{args.latent_dim}-kld{args.kld_weight}-BS{args.batch_size}"
+    proj_tag = "Proj" if args.use_proj_head else "NoProj"
+    p_val = args.contrastive_classes_per_batch
+    k_val = args.contrastive_samples_per_class
+    level_tag = "_Comp" if args.compound_level else ""
+    test_cat_tag = "-".join(args.test_cat)
+    dataset_tag = ""
+    if args.dataset == "inat":
+        dataset_tag = f"_inat_{args.train_cat}->{test_cat_tag}"
+        if args.superclass:
+            dataset_tag += f"_{args.superclass}"
+    elif args.dataset == "aircraft":
+        dataset_tag = f"_aircraft_{args.train_cat}->{test_cat_tag}"
+    # "FFT" = full fine-tuning; short per-architecture tag.
+    backbone_tag = {
+        "resnet18": "ResNet18",
+        "resnet50": "ResNet50",
+        "vit_small_patch16_224": "ViTs16",
+        "swin_tiny_patch4_window7_224": "SwinT",
+        "convnext_tiny": "ConvNeXtT",
+    }.get(args.backbone, args.backbone)
+    model_prefix = f"FFT_{backbone_tag}"
+    ema_pw_tag = f"-EMA{args.EMA_momentum}" if args.EMA_pos_weight else ""
+    vanilla_supcon_tag = "_VanillaSupCon" if args.vanilla_supcon else ""
+    ms_loss_tag = (
+        f"_MS-L{args.ms_thresh}-M{args.ms_margin}"
+        f"-A{args.ms_scale_pos}-B{args.ms_scale_neg}"
+    ) if args.ms_loss else ""
+    cross_entropy_tag = "_CrossEntropy" if args.cross_entropy else ""
+    grafit_tag = (
+        f"_Grafit-Lam{args.grafit_lam}-Views{args.grafit_views}"
+        f"{'-Bank' if args.grafit_bank else ''}"
+    ) if args.grafit else ""
+    maskcon_tag = (
+        f"_MaskCon-W{args.maskcon_w}-T0{args.maskcon_soft_tau}"
+        f"-Q{args.maskcon_queue_size}-Views{args.grafit_views}"
+        f"-M{args.EMA_momentum}"
+    ) if args.maskcon else ""
+    bucsfr_tag = (
+        f"_BuCSFR-A{args.bucsfr_alpha}-C{args.bucsfr_clusters_per_class}"
+        f"-T{args.bucsfr_threshold}-W{args.bucsfr_warmup_epochs}"
+        f"-Q{args.bucsfr_queue_size}-Views{args.grafit_views}"
+        f"-M{args.EMA_momentum}"
+    ) if args.bucsfr else ""
+    supcon_softpos_tag = (
+        f"_SupConSoftPos-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
+        f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
+        f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
+        f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
+        f"{'-Inst' + str(args.supcon_inst_weight) + 'Views' + str(args.grafit_views) if args.supcon_inst else ''}"
+        f"{ema_pw_tag}"
+    ) if args.supcon_soft_pos_loss else ""
+    taxocon_aug_tag = (
+        f"_TaxoConAug-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
+        f"-Views{args.grafit_views}"
+        f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
+        f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
+        f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
+        f"{ema_pw_tag}"
+    ) if args.taxocon_aug else ""
+    ckpt_suffix = (
+        f"{model_prefix}"
+        f"_P{p_val}_K{k_val}_BS{args.batch_size}"
+        f"_{proj_tag}"
+        f"_T{args.temperature}"
+        f"{level_tag}"
+        f"{vanilla_supcon_tag}"
+        f"{ms_loss_tag}"
+        f"{grafit_tag}"
+        f"{maskcon_tag}"
+        f"{bucsfr_tag}"
+        f"{cross_entropy_tag}"
+        f"{supcon_softpos_tag}"
+        f"{taxocon_aug_tag}"
+        f"{dataset_tag}"
+    )
 
     # Resume from a previous run if a `last.ckpt` already exists for this config.
     ckpt_dir = os.path.join(args.output_dir, "checkpoints", ckpt_suffix)
@@ -840,45 +767,43 @@ def main() -> None:
     ))
 
     # Report the best-val-loss epoch's metrics as a table at the end of
-    # training (kNN / linear-probe accuracies are only produced by the
-    # contrastive models).
-    if is_contrastive:
-        # The active soft-positive loss determines which temperature governs the
-        # positive-pair weighting.
-        if args.supcon_soft_pos_loss:
-            pos_weight_tau = (
-                f"{args.supcon_tau_start}->{args.supcon_tau_end}"
-                if args.tau_annealing else args.supcon_soft_pos_tau
-            )
-        elif args.taxocon_aug:
-            pos_weight_tau = (
-                f"{args.supcon_tau_start}->{args.supcon_tau_end}"
-                if args.tau_annealing else args.supcon_soft_pos_tau
-            )
-        else:
-            pos_weight_tau = "n/a"
+    # training.
+    # The active soft-positive loss determines which temperature governs the
+    # positive-pair weighting.
+    if args.supcon_soft_pos_loss:
+        pos_weight_tau = (
+            f"{args.supcon_tau_start}->{args.supcon_tau_end}"
+            if args.tau_annealing else args.supcon_soft_pos_tau
+        )
+    elif args.taxocon_aug:
+        pos_weight_tau = (
+            f"{args.supcon_tau_start}->{args.supcon_tau_end}"
+            if args.tau_annealing else args.supcon_soft_pos_tau
+        )
+    else:
+        pos_weight_tau = "n/a"
 
-        # Organise reports under <model>/<dataset>/ (e.g. resnet18/mammals/).
-        model_folder = {
-            "resnet18": "resnet18",
-            "resnet50": "resnet50",
-            "vit_small_patch16_224": "vits16",
-            "swin_tiny_patch4_window7_224": "swint",
-        }.get(args.backbone, args.backbone)
-        if args.dataset == "inat":
-            dataset_folder = args.superclass or f"{args.train_cat}_to_{'-'.join(args.test_cat)}"
-        elif args.dataset == "aircraft":
-            dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
-        else:
-            dataset_folder = args.dataset
+    # Organise reports under <model>/<dataset>/ (e.g. resnet18/mammals/).
+    model_folder = {
+        "resnet18": "resnet18",
+        "resnet50": "resnet50",
+        "vit_small_patch16_224": "vits16",
+        "swin_tiny_patch4_window7_224": "swint",
+    }.get(args.backbone, args.backbone)
+    if args.dataset == "inat":
+        dataset_folder = args.superclass or f"{args.train_cat}_to_{'-'.join(args.test_cat)}"
+    elif args.dataset == "aircraft":
+        dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
+    else:
+        dataset_folder = args.dataset
 
-        callbacks.append(BestValLossReporter(
-            pos_weight_tau=pos_weight_tau,
-            sinkhorn=args.sinkhorn,
-            sinkhorn_iters=args.sinkhorn_iters,
-            stats_dir=os.path.join(args.output_dir, "reports", model_folder, dataset_folder),
-            report_name=f"{ckpt_suffix}_best_val_loss_report.txt",
-        ))
+    callbacks.append(BestValLossReporter(
+        pos_weight_tau=pos_weight_tau,
+        sinkhorn=args.sinkhorn,
+        sinkhorn_iters=args.sinkhorn_iters,
+        stats_dir=os.path.join(args.output_dir, "reports", model_folder, dataset_folder),
+        report_name=f"{ckpt_suffix}_best_val_loss_report.txt",
+    ))
 
     # Trainer
     # Parse --devices: "auto" stays as-is; comma-separated digits become a
