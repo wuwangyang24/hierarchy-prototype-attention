@@ -10,6 +10,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- environment
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 PYTHON="${PYTHON:-python}"
 INAT_TRAIN_METADATA="${INAT_TRAIN_METADATA:-train_mini.json}"
 INAT_VAL_METADATA="${INAT_VAL_METADATA:-val.json}"
