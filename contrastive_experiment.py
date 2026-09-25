@@ -665,7 +665,9 @@ class ContrastiveExperiment(pl.LightningModule):
         self.log_dict(
             {
                 f"{prefix}_knn_top1": knn[1],
+                f"{prefix}_knn_top3": knn[3],
                 f"{prefix}_knn_top5": knn[5],
+                f"{prefix}_knn_top10": knn[10],
                 f"{prefix}_linprobe_top1": probe["top1_acc"],
                 f"{prefix}_linprobe_top5": probe["top5_acc"],
             },
@@ -788,7 +790,7 @@ class ContrastiveExperiment(pl.LightningModule):
     @torch.no_grad()
     def _full_set_knn_accuracy(
         embeddings: torch.Tensor, labels: torch.Tensor,
-        ks: Tuple[int, ...] = (1, 3, 5), chunk_size: int = 1024,
+        ks: Tuple[int, ...] = (1, 3, 5, 10), chunk_size: int = 1024,
     ) -> Dict[int, torch.Tensor]:
         """Top-k KNN accuracy over the entire val set (cosine, leave-one-out).
 
