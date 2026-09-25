@@ -191,6 +191,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
                  compound_level: bool = False,
                  grafit_views: int = 0,
                  grafit_bank: bool = False,
+                 return_index: bool = False,
                  seed: int = 42) -> None:
         super().__init__()
         self.image_metadata_json = image_metadata_json
@@ -210,6 +211,9 @@ class ContrastiveDataModule(pl.LightningDataModule):
         self.compound_level = compound_level
         self.grafit_views = grafit_views
         self.grafit_bank = grafit_bank
+        # Grafit's memory bank and HPA's prototype lookup both address samples
+        # by dataset index, so the train dataset has to yield it.
+        self.return_index = grafit_bank or return_index
         self.seed = seed
 
         self.classes: List[str] = []
@@ -363,10 +367,10 @@ class ContrastiveDataModule(pl.LightningDataModule):
             view_transform = build_view_transform(self.img_size)
             self.train_dataset = ContrastiveImageDataset(
                 train_samples, view_transform, num_views=self.grafit_views,
-                return_index=self.grafit_bank)
+                return_index=self.return_index)
         else:
             self.train_dataset = ContrastiveImageDataset(
-                train_samples, transform, return_index=self.grafit_bank)
+                train_samples, transform, return_index=self.return_index)
         self.val_dataset = ContrastiveImageDataset(val_samples, transform)
         self._train_labels = [label for _, label in train_samples]
         self._val_labels = [label for _, label in val_samples]
@@ -503,6 +507,7 @@ class InatDataModule(pl.LightningDataModule):
                  superclass: Optional[str] = None,
                  grafit_views: int = 0,
                  grafit_bank: bool = False,
+                 return_index: bool = False,
                  seed: int = 42) -> None:
         super().__init__()
         self.train_metadata = train_metadata
@@ -519,6 +524,7 @@ class InatDataModule(pl.LightningDataModule):
         self.samples_per_class = samples_per_class
         self.grafit_views = grafit_views
         self.grafit_bank = grafit_bank
+        self.return_index = grafit_bank or return_index
         self.seed = seed
 
         self.train_classes: List[str] = []
@@ -640,7 +646,7 @@ class InatDataModule(pl.LightningDataModule):
         self.train_dataset = InatContrastiveDataset(
             train_samples, self._train_transform(transform),
             num_views=max(self.grafit_views, 1),
-            return_index=self.grafit_bank)
+            return_index=self.return_index)
         self.val_dataset = InatContrastiveDataset(val_samples, transform)
 
         test_summary = ", ".join(
@@ -739,6 +745,7 @@ class FGVCAircraftDataModule(pl.LightningDataModule):
                  download: bool = False,
                  grafit_views: int = 0,
                  grafit_bank: bool = False,
+                 return_index: bool = False,
                  seed: int = 42) -> None:
         super().__init__()
         self.root = root
@@ -754,6 +761,7 @@ class FGVCAircraftDataModule(pl.LightningDataModule):
         self.download = download
         self.grafit_views = grafit_views
         self.grafit_bank = grafit_bank
+        self.return_index = grafit_bank or return_index
         self.seed = seed
 
         invalid = [c for c in [self.train_cat] + self.test_cats
@@ -861,7 +869,7 @@ class FGVCAircraftDataModule(pl.LightningDataModule):
         self.train_dataset = InatContrastiveDataset(
             train_samples, self._train_transform(transform),
             num_views=max(self.grafit_views, 1),
-            return_index=self.grafit_bank)
+            return_index=self.return_index)
         self.val_dataset = InatContrastiveDataset(val_samples, transform)
 
         test_summary = ", ".join(

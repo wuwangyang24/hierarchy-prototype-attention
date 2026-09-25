@@ -1,10 +1,11 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+from .hpa import HierarchicalPrototypeAttention
 from Loss import (
     batch_knn_accuracy, gaussianity_metrics,
     SupConSoftPosLoss, TaxoConAugLoss,
@@ -48,6 +49,12 @@ class Backbone(nn.Module):
         use_proj_head: if True, add a 2-layer MLP projection head on top of the
             backbone features; otherwise output the L2-normalized backbone
             features directly.
+        use_hpa: add a Hierarchical Prototype Attention block on the final
+            embedding. When False the model is the untouched CE/SupCon baseline.
+        hpa_heads: attention heads of the HPA block.
+        hpa_gamma: HPA residual scale (initial value when it is learned).
+        hpa_learn_gamma: learn the residual scale instead of fixing it.
+        hpa_layernorm: LayerNorm the HPA prototype context before the residual.
         pretrained: load ImageNet-pretrained backbone weights.
     """
 
@@ -71,6 +78,11 @@ class Backbone(nn.Module):
                  num_classes: Optional[int] = None,
                  cross_entropy: bool = False,
                  grafit_predictor: bool = False,
+                 use_hpa: bool = False,
+                 hpa_heads: int = 1,
+                 hpa_gamma: float = 0.0,
+                 hpa_learn_gamma: bool = True,
+                 hpa_layernorm: bool = True,
                  pretrained: bool = True) -> None:
         super().__init__()
 
@@ -141,6 +153,16 @@ class Backbone(nn.Module):
         else:
             self.grafit_predictor = None
 
+        # Hierarchical Prototype Attention on the final image embedding. When
+        # disabled the module is absent and encode() is the untouched baseline.
+        self.hpa = HierarchicalPrototypeAttention(
+            dim=self.output_dim,
+            num_heads=hpa_heads,
+            learn_gamma=hpa_learn_gamma,
+            gamma=hpa_gamma,
+            layernorm=hpa_layernorm,
+        ) if use_hpa else None
+
         self.supcon_soft_pos_loss = SupConSoftPosLoss(
             pos_weight_tau=supcon_soft_pos_tau,
             sinkhorn=sinkhorn,
@@ -173,6 +195,24 @@ class Backbone(nn.Module):
 
     def forward(self, x: Tensor, normalize: bool = True, **kwargs) -> Tensor:
         return self.encode(x, normalize=normalize)
+
+    def encode_with_hpa(
+        self, x: Tensor, prototype_fn: Callable[[Tensor], Tensor],
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """Encode ``x`` and refine the embeddings with ancestor prototypes.
+
+        ``prototype_fn`` maps the base embeddings (N, D) to their detached
+        ancestor prototypes (N, L, D); it is a callable so that inference-time
+        nearest-prototype retrieval can reuse this single forward pass.
+
+        Returns ``(refined_embeddings, hpa_diagnostics)``.
+        """
+        if self.hpa is None:
+            raise RuntimeError("Model was built without use_hpa=True.")
+        z = self.encode(x, normalize=True)
+        with torch.no_grad():
+            prototypes = prototype_fn(z)
+        return self.hpa(z, prototypes)
 
     def loss_function(self, embeddings: Tensor, labels: Tensor,
                       **kwargs) -> Dict[str, Tensor]:

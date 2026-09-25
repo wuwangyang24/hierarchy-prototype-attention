@@ -10,3 +10,4 @@ pandas>=2.0
 catboost>=1.2
 timm>=0.9.0
 openpyxl 
+pytest>=7.0

@@ -232,6 +232,41 @@ def parse_args() -> argparse.Namespace:
                              "to trade extra compute for lower memory (allows larger "
                              "batches). Only used with --model backbone.")
 
+    # CE + Hierarchical Prototype Attention (requires --cross_entropy)
+    parser.add_argument("--use_hpa", action="store_true",
+                        help="Refine the final embedding with Hierarchical Prototype "
+                             "Attention before the CE classifier. The hierarchy is "
+                             "discovered from coarse labels only. Without this flag "
+                             "the run is the plain CE baseline.")
+    parser.add_argument("--hpa_levels", type=int, default=3,
+                        help="Number L of ancestor prototypes each image attends to "
+                             "(local -> intermediate -> broad). Default: 3")
+    parser.add_argument("--hpa_heads", type=int, default=1,
+                        help="Attention heads in the HPA block. Default: 1")
+    parser.add_argument("--hpa_gamma", type=float, default=0.0,
+                        help="Residual scale of the prototype context. Initial value "
+                             "of the learned scalar, or the fixed value when "
+                             "--hpa_fixed_gamma is set. Default: 0.0")
+    parser.add_argument("--hpa_fixed_gamma", action="store_true",
+                        help="Keep the HPA residual scale fixed at --hpa_gamma "
+                             "instead of learning it.")
+    parser.add_argument("--hpa_no_layernorm", action="store_true",
+                        help="Disable the LayerNorm on the HPA prototype context.")
+    parser.add_argument("--hierarchy_warmup_epochs", type=int, default=5,
+                        help="CE-only epochs before the first hierarchy is built "
+                             "(HPA is inactive until then). Default: 5")
+    parser.add_argument("--hierarchy_update_interval", type=int, default=5,
+                        help="Rebuild the hierarchy and prototypes every N epochs "
+                             "after warm-up. Default: 5")
+    parser.add_argument("--hierarchy_metric", type=str, default="cosine",
+                        help="Pairwise distance for the agglomerative clustering")
+    parser.add_argument("--hierarchy_linkage", type=str, default="average",
+                        help="Linkage criterion for the agglomerative clustering")
+    parser.add_argument("--hierarchy_snapshot_dir", type=str, default=None,
+                        help="Directory to dump one .npz per hierarchy refresh for "
+                             "offline analysis (see analyze_hierarchy.py). Disabled "
+                             "by default.")
+
     # Contrastive dataset (synthesis-program labels; only used when --model backbone)
     parser.add_argument("--contrastive_metadata", type=str, nargs="+", default=None,
                         help="JSON metadata (compounds -> plates -> image paths) for "
@@ -480,6 +515,12 @@ def main() -> None:
             "loss. Pass only --taxocon_aug (it reuses --supcon_soft_pos_tau)."
         )
 
+    if args.use_hpa and not args.cross_entropy:
+        raise ValueError(
+            "--use_hpa requires --cross_entropy: CE is the only training "
+            "objective in this version of Hierarchical Prototype Attention."
+        )
+
     # Multi-view batches are only meaningful for the instance-level term.
     supcon_inst = args.supcon_soft_pos_loss and args.supcon_inst
     use_instance_term = args.grafit or supcon_inst
@@ -507,6 +548,7 @@ def main() -> None:
             superclass=args.superclass,
             grafit_views=grafit_views,
             grafit_bank=grafit_bank,
+            return_index=args.use_hpa,
             seed=args.seed,
         )
     elif args.dataset == "aircraft":
@@ -525,6 +567,7 @@ def main() -> None:
             download=args.aircraft_download,
             grafit_views=grafit_views,
             grafit_bank=grafit_bank,
+            return_index=args.use_hpa,
             seed=args.seed,
         )
     else:
@@ -558,6 +601,7 @@ def main() -> None:
             compound_level=args.compound_level,
             grafit_views=grafit_views,
             grafit_bank=grafit_bank,
+            return_index=args.use_hpa,
             seed=args.seed,
         )
 
@@ -593,6 +637,11 @@ def main() -> None:
         num_classes=num_classes,
         cross_entropy=args.cross_entropy or args.bucsfr,
         grafit_predictor=use_instance_term,
+        use_hpa=args.use_hpa,
+        hpa_heads=args.hpa_heads,
+        hpa_gamma=args.hpa_gamma,
+        hpa_learn_gamma=not args.hpa_fixed_gamma,
+        hpa_layernorm=not args.hpa_no_layernorm,
     )
 
     experiment = ContrastiveExperiment(
@@ -639,6 +688,13 @@ def main() -> None:
         sinkhorn_iters=args.sinkhorn_iters,
         EMA_pos_weight=args.EMA_pos_weight,
         EMA_momentum=args.EMA_momentum,
+        use_hpa=args.use_hpa,
+        hpa_levels=args.hpa_levels,
+        hierarchy_warmup_epochs=args.hierarchy_warmup_epochs,
+        hierarchy_update_interval=args.hierarchy_update_interval,
+        hierarchy_metric=args.hierarchy_metric,
+        hierarchy_linkage=args.hierarchy_linkage,
+        hierarchy_snapshot_dir=args.hierarchy_snapshot_dir,
         train_cat=args.train_cat,
         test_cats=args.test_cat,
     )
@@ -672,6 +728,11 @@ def main() -> None:
         f"-A{args.ms_scale_pos}-B{args.ms_scale_neg}"
     ) if args.ms_loss else ""
     cross_entropy_tag = "_CrossEntropy" if args.cross_entropy else ""
+    hpa_tag = (
+        f"_HPA-L{args.hpa_levels}-H{args.hpa_heads}"
+        f"-G{args.hpa_gamma}{'fix' if args.hpa_fixed_gamma else ''}"
+        f"-W{args.hierarchy_warmup_epochs}-E{args.hierarchy_update_interval}"
+    ) if args.use_hpa else ""
     grafit_tag = (
         f"_Grafit-Lam{args.grafit_lam}-Views{args.grafit_views}"
         f"{'-Bank' if args.grafit_bank else ''}"
@@ -715,6 +776,7 @@ def main() -> None:
         f"{maskcon_tag}"
         f"{bucsfr_tag}"
         f"{cross_entropy_tag}"
+        f"{hpa_tag}"
         f"{supcon_softpos_tag}"
         f"{taxocon_aug_tag}"
         f"{dataset_tag}"
