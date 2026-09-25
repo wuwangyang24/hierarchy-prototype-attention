@@ -150,7 +150,7 @@ class BestValLossReporter(Callback):
 from Models import Backbone
 from dataset import (ContrastiveDataModule, InatDataModule,
                      FGVCAircraftDataModule)
-from contrastive_experiment import ContrastiveExperiment
+from experiment import ContrastiveExperiment
 
 # Use file-system based tensor sharing to avoid /dev/shm exhaustion, which
 # otherwise hangs DataLoader workers in containers with a small shared-memory
