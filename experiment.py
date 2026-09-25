@@ -631,11 +631,11 @@ class ContrastiveExperiment(pl.LightningModule):
         if val_test_labels.ndim == 1:
             val_test_labels = val_test_labels.unsqueeze(1)
 
-        # kNN + linear probe on the train_cat labels.
+        # Recall@k + linear probe on the train_cat labels.
         self._eval_and_log(val_embeddings, val_train_labels,
                            f"val_train_{self.train_cat}", prog_bar=False)
 
-        # kNN + linear probe on each test_cat taxonomy level.
+        # Recall@k + linear probe on each test_cat taxonomy level.
         for i, name in enumerate(self.test_cats):
             self._eval_and_log(
                 val_embeddings, val_test_labels[:, i],
@@ -659,11 +659,16 @@ class ContrastiveExperiment(pl.LightningModule):
 
     def _eval_and_log(self, embeddings: torch.Tensor, labels: torch.Tensor,
                       prefix: str, prog_bar: bool = False) -> None:
-        """Compute top-1/5 kNN and linear-probe accuracy for one label set."""
+        """Compute Recall@k, kNN-vote and linear-probe accuracy for one label set."""
+        recall = self._full_set_recall_at_k(embeddings, labels)
         knn = self._full_set_knn_accuracy(embeddings, labels)
         probe = self._linear_probe(embeddings, labels)
         self.log_dict(
             {
+                f"{prefix}_recall_at1": recall[1],
+                f"{prefix}_recall_at3": recall[3],
+                f"{prefix}_recall_at5": recall[5],
+                f"{prefix}_recall_at10": recall[10],
                 f"{prefix}_knn_top1": knn[1],
                 f"{prefix}_knn_top3": knn[3],
                 f"{prefix}_knn_top5": knn[5],
@@ -788,13 +793,13 @@ class ContrastiveExperiment(pl.LightningModule):
 
     @staticmethod
     @torch.no_grad()
-    def _full_set_knn_accuracy(
+    def _full_set_recall_at_k(
         embeddings: torch.Tensor, labels: torch.Tensor,
         ks: Tuple[int, ...] = (1, 3, 5, 10), chunk_size: int = 1024,
     ) -> Dict[int, torch.Tensor]:
-        """Top-k KNN accuracy over the entire val set (cosine, leave-one-out).
+        """Recall@k over the entire val set (cosine, leave-one-out).
 
-        A sample is a top-k hit if any of its k nearest neighbours across the
+        A sample counts as a hit if any of its k nearest neighbours across the
         full set shares its label. Computed in row chunks to bound memory.
         """
         embeddings = torch.nn.functional.normalize(embeddings, dim=1)
@@ -815,6 +820,48 @@ class ContrastiveExperiment(pl.LightningModule):
             for k in ks:
                 hits[k][start:end] = match[:, :min(k, max_k)].any(dim=1)
         return {k: hits[k].float().mean() for k in ks}
+
+    @staticmethod
+    @torch.no_grad()
+    def _full_set_knn_accuracy(
+        embeddings: torch.Tensor, labels: torch.Tensor,
+        ks: Tuple[int, ...] = (1, 3, 5, 10), chunk_size: int = 1024,
+    ) -> Dict[int, torch.Tensor]:
+        """Top-k kNN classification accuracy (cosine, leave-one-out).
+
+        Each sample is classified by a majority vote over its k nearest
+        neighbours across the full set; ties are broken by summed cosine
+        similarity. Computed in row chunks to bound memory.
+        """
+        embeddings = torch.nn.functional.normalize(embeddings, dim=1)
+        labels = labels.view(-1)
+        n = embeddings.size(0)
+        max_k = min(max(ks), n - 1)
+        if max_k < 1:
+            return {k: torch.tensor(0.0, device=embeddings.device) for k in ks}
+
+        num_classes = int(labels.max().item()) + 1
+        correct = {k: torch.zeros(n, dtype=torch.bool, device=embeddings.device)
+                   for k in ks}
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            rows = end - start
+            sim = embeddings[start:end] @ embeddings.t()       # (rows, n)
+            sim[torch.arange(rows, device=embeddings.device),
+                torch.arange(start, end, device=embeddings.device)] = float("-inf")
+            topk = sim.topk(max_k, dim=1)
+            nbr_labels = labels[topk.indices]                   # (rows, max_k)
+            # Similarity is in [-1, 1], so the scaled tiebreak can never
+            # outweigh a single vote.
+            tiebreak = topk.values.clamp_min(0) * (1.0 / (2 * max_k))
+            for k in ks:
+                kk = min(k, max_k)
+                votes = torch.zeros(rows, num_classes, device=embeddings.device)
+                votes.scatter_add_(1, nbr_labels[:, :kk],
+                                   torch.ones(rows, kk, device=embeddings.device))
+                votes.scatter_add_(1, nbr_labels[:, :kk], tiebreak[:, :kk])
+                correct[k][start:end] = votes.argmax(dim=1) == labels[start:end]
+        return {k: correct[k].float().mean() for k in ks}
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(

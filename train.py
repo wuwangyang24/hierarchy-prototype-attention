@@ -10,8 +10,9 @@ from pytorch_lightning.loggers import WandbLogger
 
 class BestValLossReporter(Callback):
     """Track the epoch with the lowest ``val_loss`` and, at the end of
-    training, print a table of the kNN / linear-probe metrics recorded at that
-    epoch together with the positive-weight temperature and Sinkhorn settings."""
+    training, print a table of the Recall@k / linear-probe metrics recorded at
+    that epoch together with the positive-weight temperature and Sinkhorn
+    settings."""
 
     def __init__(self, pos_weight_tau, sinkhorn: bool, sinkhorn_iters: int,
                  stats_dir: str, report_name: str) -> None:
@@ -28,7 +29,7 @@ class BestValLossReporter(Callback):
 
     def on_validation_end(self, trainer, pl_module) -> None:
         # Use on_validation_end (not on_validation_epoch_end) so that the
-        # LightningModule has already logged this epoch's kNN / linear-probe
+        # LightningModule has already logged this epoch's Recall@k / linear-probe
         # metrics; callback on_validation_epoch_end hooks run *before* the
         # module's, so callback_metrics would otherwise hold stale values.
         if trainer.sanity_checking:
@@ -44,7 +45,7 @@ class BestValLossReporter(Callback):
             self.best_metrics = {
                 k: float(v)
                 for k, v in metrics.items()
-                if ("knn_top" in k or "linprobe_top" in k)
+                if ("recall_at" in k or "knn_top" in k or "linprobe_top" in k)
             }
             self.best_cophenetic = {
                 k: float(v)
@@ -65,11 +66,14 @@ class BestValLossReporter(Callback):
         def fmt(value):
             return f"{value:.4f}" if value is not None else "-"
 
-        header = ["Eval", "kNN@1", "kNN@5", "LinProbe@1", "LinProbe@5"]
+        header = ["Eval", "Recall@1", "Recall@5", "kNN@1", "kNN@5",
+                  "LinProbe@1", "LinProbe@5"]
         rows = []
         for prefix in prefixes:
             rows.append([
                 prefix,
+                fmt(self.best_metrics.get(f"{prefix}_recall_at1")),
+                fmt(self.best_metrics.get(f"{prefix}_recall_at5")),
                 fmt(self.best_metrics.get(f"{prefix}_knn_top1")),
                 fmt(self.best_metrics.get(f"{prefix}_knn_top5")),
                 fmt(self.best_metrics.get(f"{prefix}_linprobe_top1")),
@@ -104,7 +108,7 @@ class BestValLossReporter(Callback):
             lines.append("-+-".join("-" * w for w in widths))
             lines.extend(render(r) for r in rows)
         else:
-            lines.append("(no kNN / linear-probe metrics were recorded)")
+            lines.append("(no Recall@k / kNN / linear-probe metrics were recorded)")
         if self.best_cophenetic:
             width = max(60, sum(widths) + 3 * (len(widths) - 1))
             lines.append("-" * width)

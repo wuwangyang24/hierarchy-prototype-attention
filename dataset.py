@@ -413,8 +413,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
         # Always use a plain full-coverage loader for validation. The PK sampler
         # oversamples small classes with replacement (duplicate images) and
         # restricts each batch to a few classes, which trivially inflates the
-        # leave-one-out val_knn_acc. Evaluating every unique image once against
-        # all classes gives an honest metric.
+        # leave-one-out validation Recall@k. Evaluating every unique image once
+        # against all classes gives an honest metric.
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
@@ -689,8 +689,8 @@ class InatDataModule(pl.LightningDataModule):
         # Always use a plain full-coverage loader for validation. The PK sampler
         # oversamples small classes with replacement (duplicate images) and
         # restricts each batch to a few classes, which trivially inflates the
-        # leave-one-out val_knn_acc. Evaluating every unique image once against
-        # all classes gives an honest metric.
+        # leave-one-out validation Recall@k. Evaluating every unique image once
+        # against all classes gives an honest metric.
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
