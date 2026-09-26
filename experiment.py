@@ -7,10 +7,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from tqdm.auto import tqdm
 
 from Models import Backbone
-from Hierarchy import HierarchyManager, PrototypeBank
+from Hierarchy import HierarchyManager, PrototypeBank, progress_bar
 from Loss import (
     BuCSFRDendrogram, GrafitMemoryBank, MaskConQueue, multiview_similarity,
 )
@@ -349,9 +348,9 @@ class ContrastiveExperiment(pl.LightningModule):
         labels = torch.zeros(len(dataset), dtype=torch.long, device=self.device)
         was_training = self.model.training
         self.model.eval()
-        for batch in tqdm(loader, desc=f"[HPA] encoding train set (epoch "
-                                       f"{self.current_epoch})",
-                          leave=False, dynamic_ncols=True):
+        for batch in progress_bar(
+                loader,
+                f"[HPA] encoding train set (epoch {self.current_epoch})"):
             # Positional access only: batch[2] holds evaluation labels and must
             # not reach the hierarchy.
             images, coarse_labels, idx = batch[0], batch[1], batch[-1]

@@ -13,7 +13,9 @@ must never be passed in or inspected here.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
+
+import sys
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -183,8 +185,8 @@ class HierarchyManager:
         rng = np.random.default_rng(self.seed)
 
         classes = np.unique(coarse_labels)
-        progress = tqdm(classes, desc="[HPA] clustering coarse classes",
-                        leave=False, dynamic_ncols=True, disable=not self.progress)
+        progress = progress_bar(classes, "[HPA] clustering coarse classes",
+                                disable=not self.progress)
         for coarse in progress:
             member_idx = np.flatnonzero(coarse_labels == coarse)
             fit_idx, rest_idx = self._split_for_fit(member_idx, rng)
@@ -327,6 +329,19 @@ class HierarchyManager:
                 stack.append((int(right), depth + 1))
 
         return selected
+
+
+def progress_bar(iterable: Iterable, desc: str, disable: bool = False,
+                 total: Optional[int] = None) -> tqdm:
+    """tqdm bar that stays readable in log files.
+
+    Without a TTY every refresh emits a new line, so redirected runs get a
+    fixed-width bar updated at most every 30 s instead of once per item.
+    """
+    tty = sys.stdout.isatty()
+    return tqdm(iterable, desc=desc, total=total, disable=disable,
+                file=sys.stdout, leave=not tty, dynamic_ncols=tty,
+                ncols=None if tty else 80, mininterval=0.1 if tty else 30.0)
 
 
 def _nearest_rows_per_level(x: np.ndarray, prototypes: np.ndarray,
