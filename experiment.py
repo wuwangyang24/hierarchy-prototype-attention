@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from tqdm.auto import tqdm
 
 from Models import Backbone
 from Hierarchy import HierarchyManager, PrototypeBank
@@ -78,6 +79,8 @@ class ContrastiveExperiment(pl.LightningModule):
                  hierarchy_metric: str = "cosine",
                  hierarchy_linkage: str = "average",
                  hierarchy_snapshot_dir: Optional[str] = None,
+                 hierarchy_max_samples_per_class: Optional[int] = None,
+                 hierarchy_seed: int = 0,
                  train_cat: str = "train",
                  test_cats: Optional[list] = None) -> None:
         super().__init__()
@@ -162,6 +165,8 @@ class ContrastiveExperiment(pl.LightningModule):
             num_levels=hpa_levels,
             metric=hierarchy_metric,
             linkage_method=hierarchy_linkage,
+            max_samples_per_class=hierarchy_max_samples_per_class,
+            seed=hierarchy_seed,
         ) if use_hpa else None
         self.prototype_bank = PrototypeBank()
         self._hpa_diagnostics: Optional[Dict[str, torch.Tensor]] = None
@@ -344,7 +349,9 @@ class ContrastiveExperiment(pl.LightningModule):
         labels = torch.zeros(len(dataset), dtype=torch.long, device=self.device)
         was_training = self.model.training
         self.model.eval()
-        for batch in loader:
+        for batch in tqdm(loader, desc=f"[HPA] encoding train set (epoch "
+                                       f"{self.current_epoch})",
+                          leave=False, dynamic_ncols=True):
             # Positional access only: batch[2] holds evaluation labels and must
             # not reach the hierarchy.
             images, coarse_labels, idx = batch[0], batch[1], batch[-1]

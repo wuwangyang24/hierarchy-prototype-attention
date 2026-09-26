@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
+from tqdm.auto import tqdm
 
 try:
     from scipy.cluster.hierarchy import linkage
@@ -103,15 +104,27 @@ class HierarchyManager:
             evenly spaced values ``l / (L + 1)`` -> ``0.25, 0.5, 0.75`` for
             ``L = 3``. Must be sorted ascending so that the selected nodes come
             out ordered local -> broad.
+        max_samples_per_class: cap on how many samples of a coarse class enter
+            the dendrogram. ``pdist`` is quadratic in time and memory, so large
+            classes are clustered on a random subset and the remaining samples
+            are attached to their nearest selected prototype per level. ``None``
+            uses every sample.
+        seed: seed of the subsampling RNG.
+        progress: show a tqdm bar over the coarse classes while clustering.
     """
 
     def __init__(self,
                  num_levels: int = 3,
                  metric: str = "cosine",
                  linkage_method: str = "average",
-                 level_fractions: Optional[Sequence[float]] = None) -> None:
+                 level_fractions: Optional[Sequence[float]] = None,
+                 max_samples_per_class: Optional[int] = None,
+                 seed: int = 0,
+                 progress: bool = True) -> None:
         if num_levels < 1:
             raise ValueError("num_levels must be >= 1")
+        if max_samples_per_class is not None and max_samples_per_class < 3:
+            raise ValueError("max_samples_per_class must be >= 3")
         if level_fractions is None:
             level_fractions = [(i + 1) / (num_levels + 1) for i in range(num_levels)]
         level_fractions = [float(f) for f in level_fractions]
@@ -126,6 +139,9 @@ class HierarchyManager:
         self.metric = metric
         self.linkage_method = linkage_method
         self.level_fractions = np.asarray(level_fractions, dtype=np.float64)
+        self.max_samples_per_class = max_samples_per_class
+        self.seed = seed
+        self.progress = progress
 
     def build(self, embeddings: np.ndarray, coarse_labels: np.ndarray,
               sample_ids: Optional[np.ndarray] = None) -> HierarchySnapshot:
@@ -164,11 +180,18 @@ class HierarchyManager:
 
         row_offset = 0   # running number of prototypes emitted so far
         node_offset = 0  # keeps dendrogram node ids unique across coarse classes
+        rng = np.random.default_rng(self.seed)
 
-        for coarse in np.unique(coarse_labels):
+        classes = np.unique(coarse_labels)
+        progress = tqdm(classes, desc="[HPA] clustering coarse classes",
+                        leave=False, dynamic_ncols=True, disable=not self.progress)
+        for coarse in progress:
             member_idx = np.flatnonzero(coarse_labels == coarse)
+            fit_idx, rest_idx = self._split_for_fit(member_idx, rng)
+            progress.set_postfix(cls=int(coarse), n=int(fit_idx.size),
+                                 refresh=False)
             # Every clustering problem sees exactly one coarse class.
-            block = self._build_one_class(embeddings[member_idx])
+            block = self._build_one_class(embeddings[fit_idx])
 
             n_nodes = block["num_tree_nodes"]
             protos, node_local_ids, sizes, sel_rows = (
@@ -176,8 +199,14 @@ class HierarchyManager:
                 block["level_rows"],
             )
 
-            level_proto_index[member_idx] = sel_rows + row_offset
-            level_node_ids[member_idx] = node_local_ids[sel_rows] + node_offset
+            level_proto_index[fit_idx] = sel_rows + row_offset
+            level_node_ids[fit_idx] = node_local_ids[sel_rows] + node_offset
+
+            if rest_idx.size:
+                rest_rows = _nearest_rows_per_level(
+                    embeddings[rest_idx], protos, sel_rows)
+                level_proto_index[rest_idx] = rest_rows + row_offset
+                level_node_ids[rest_idx] = node_local_ids[rest_rows] + node_offset
 
             proto_blocks.append(protos)
             node_id_blocks.append(node_local_ids + node_offset)
@@ -208,6 +237,16 @@ class HierarchyManager:
             coarse_labels=coarse_labels,
             nodes_per_coarse=nodes_per_coarse,
         )
+
+    def _split_for_fit(self, member_idx: np.ndarray, rng: np.random.Generator
+                       ) -> tuple:
+        """Split one class into the samples that are clustered and the rest."""
+        cap = self.max_samples_per_class
+        if cap is None or member_idx.size <= cap:
+            return member_idx, np.zeros(0, dtype=np.int64)
+        perm = rng.permutation(member_idx.size)
+        # Sorted so the dendrogram is invariant to the draw order.
+        return np.sort(member_idx[perm[:cap]]), np.sort(member_idx[perm[cap:]])
 
     def _build_one_class(self, x: np.ndarray) -> Dict[str, np.ndarray]:
         """Dendrogram + ancestor selection for the samples of a single coarse class.
@@ -288,6 +327,21 @@ class HierarchyManager:
                 stack.append((int(right), depth + 1))
 
         return selected
+
+
+def _nearest_rows_per_level(x: np.ndarray, prototypes: np.ndarray,
+                            sel_rows: np.ndarray) -> np.ndarray:
+    """Attach held-out samples of a class to the nearest prototype per level.
+
+    Both sides are L2-normalized, so the dot product ranks by cosine similarity.
+    """
+    z = _l2_normalize(x.astype(np.float32))
+    rows = np.empty((x.shape[0], sel_rows.shape[1]), dtype=np.int64)
+    for level in range(sel_rows.shape[1]):
+        candidates = np.unique(sel_rows[:, level])
+        rows[:, level] = candidates[
+            (z @ prototypes[candidates].T).argmax(axis=1)]
+    return rows
 
 
 def _l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:

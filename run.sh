@@ -7,6 +7,11 @@
 #   ./run.sh test        # sanity checks
 #   ./run.sh analyze     # evaluation-only hierarchy diagnostics
 #   ./run.sh all         # baseline -> hpa -> analyze
+#
+# A second argument (or the GPUS env var) selects the GPU(s):
+#   ./run.sh hpa 0       # single GPU
+#   ./run.sh hpa 0,1     # two GPUs
+#   ./run.sh hpa auto    # let Lightning decide (default)
 set -euo pipefail
 
 # ---------------------------------------------------------------- environment
@@ -18,6 +23,10 @@ INAT_TRAIN_DIR="${INAT_TRAIN_DIR:-inat2021/train_mini}"
 INAT_VAL_DIR="${INAT_VAL_DIR:-inat2021/val}"
 SUPERCLASS="${SUPERCLASS:-}"          # e.g. Insects, to keep the run tractable
 HIERARCHY_DIR="${HIERARCHY_DIR:-results/hierarchy}"
+# Agglomerative clustering is O(n^2); cap the samples clustered per coarse class.
+HIERARCHY_MAX_PER_CLASS="${HIERARCHY_MAX_PER_CLASS:-10000}"
+GPUS="${2:-${GPUS:-auto}}"            # "auto", or comma-separated GPU indices
+ACCELERATOR="${ACCELERATOR:-auto}"
 
 TRAIN_CAT="${TRAIN_CAT:-order}"       # coarse label the model is trained on
 FINE_CAT="${FINE_CAT:-species}"       # hidden label, evaluation only
@@ -39,6 +48,8 @@ COMMON=(
   --batch_size 128
   --epochs 60
   --seed 42
+  --accelerator "$ACCELERATOR"
+  --devices "$GPUS"
 )
 if [[ -n "$SUPERCLASS" ]]; then
   COMMON+=(--superclass "$SUPERCLASS")
@@ -62,6 +73,7 @@ run_hpa() {
     --hierarchy_update_interval 5 \
     --hierarchy_metric cosine \
     --hierarchy_linkage average \
+    --hierarchy_max_samples_per_class "$HIERARCHY_MAX_PER_CLASS" \
     --hierarchy_snapshot_dir "$HIERARCHY_DIR"
 }
 
@@ -92,5 +104,5 @@ case "${1:-all}" in
   test)     run_test ;;
   analyze)  run_analyze ;;
   all)      run_baseline; run_hpa; run_analyze ;;
-  *)        echo "Usage: $0 {baseline|hpa|test|analyze|all}" >&2; exit 1 ;;
+  *)        echo "Usage: $0 {baseline|hpa|test|analyze|all} [gpus]" >&2; exit 1 ;;
 esac

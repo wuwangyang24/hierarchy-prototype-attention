@@ -268,6 +268,12 @@ def parse_args() -> argparse.Namespace:
                         help="Directory to dump one .npz per hierarchy refresh for "
                              "offline analysis (see analyze_hierarchy.py). Disabled "
                              "by default.")
+    parser.add_argument("--hierarchy_max_samples_per_class", type=int, default=None,
+                        help="Cluster at most N samples per coarse class and attach "
+                             "the rest to their nearest prototype. Agglomerative "
+                             "clustering is quadratic, so cap this (e.g. 10000) when "
+                             "a coarse class holds tens of thousands of images. "
+                             "Default: no cap.")
 
     # Losses
     parser.add_argument("--supcon_soft_pos_loss", action="store_true",
@@ -621,6 +627,8 @@ def main() -> None:
         hierarchy_metric=args.hierarchy_metric,
         hierarchy_linkage=args.hierarchy_linkage,
         hierarchy_snapshot_dir=args.hierarchy_snapshot_dir,
+        hierarchy_max_samples_per_class=args.hierarchy_max_samples_per_class,
+        hierarchy_seed=args.seed,
         train_cat=args.train_cat,
         test_cats=args.test_cat,
     )
