@@ -10,14 +10,15 @@ import pytorch_lightning as pl
 
 from Models import Backbone
 from Hierarchy import HierarchyManager, PrototypeBank, progress_bar
-from Loss import (
-    BuCSFRDendrogram, GrafitMemoryBank, MaskConQueue, multiview_similarity,
-)
+from Loss import BuCSFRDendrogram, GrafitMemoryBank, MaskConQueue
 
 
 class ContrastiveExperiment(pl.LightningModule):
-    """LightningModule wrapping the backbone model for supervised contrastive
-    (SupCon) training on synthesis-program labels.
+    """LightningModule wrapping the backbone model for weakly-supervised
+    contrastive training on coarse labels.
+
+    Exactly one objective is active: MaskCon, Grafit, BuCSFR or Hierarchical
+    Prototype Attention.
 
     Args:
         model: the :class:`Backbone` model to train.
@@ -36,16 +37,6 @@ class ContrastiveExperiment(pl.LightningModule):
                  scheduler: str = "exponential",
                  warmup_epochs: int = 0,
                  max_epochs: int = 100,
-                 supcon_softpos: bool = False,
-                 supcon_inst: bool = False,
-                 supcon_inst_weight: float = 1.0,
-                 taxocon_aug: bool = False,
-                 vanilla_supcon: bool = False,
-                 ms_loss: bool = False,
-                 ms_thresh: float = 0.5,
-                 ms_margin: float = 0.1,
-                 ms_scale_pos: float = 2.0,
-                 ms_scale_neg: float = 40.0,
                  grafit: bool = False,
                  grafit_lam: float = 1.0,
                  grafit_bank_size: int = 0,
@@ -60,26 +51,20 @@ class ContrastiveExperiment(pl.LightningModule):
                  bucsfr_threshold: float = 1.1,
                  bucsfr_warmup_epochs: int = 10,
                  bucsfr_refresh_every: int = 1,
-                 cross_entropy: bool = False,
-                 supcon_soft_pos_tau: float = 0.1,
-                 denom_pos_weight: bool = False,
-                 tau_annealing: bool = False,
-                 supcon_tau_start: float = 0.1,
-                 supcon_tau_end: float = 0.1,
-                 no_pos_weight_epoch: int = 0,
-                 sinkhorn: bool = False,
-                 sinkhorn_iters: int = 5,
-                 EMA_pos_weight: bool = False,
                  EMA_momentum: float = 0.999,
                  use_hpa: bool = False,
                  hpa_levels: int = 3,
-                 hierarchy_warmup_epochs: int = 5,
+                 hpa_consistency_weight: float = 1.0,
+                 hpa_assign_tau: float = 0.1,
+                 hpa_target_tau: float = 0.04,
+                 hpa_sinkhorn_iters: int = 3,
                  hierarchy_update_interval: int = 5,
                  hierarchy_metric: str = "cosine",
                  hierarchy_linkage: str = "average",
                  hierarchy_snapshot_dir: Optional[str] = None,
                  hierarchy_max_samples_per_class: Optional[int] = None,
                  hierarchy_seed: int = 0,
+                 hierarchy_ema: bool = True,
                  train_cat: str = "train",
                  test_cats: Optional[list] = None) -> None:
         super().__init__()
@@ -91,16 +76,6 @@ class ContrastiveExperiment(pl.LightningModule):
         self.scheduler_type = scheduler
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
-        self.supcon_softpos = supcon_softpos
-        self.supcon_inst = supcon_inst
-        self.supcon_inst_weight = supcon_inst_weight
-        self.taxocon_aug = taxocon_aug
-        self.vanilla_supcon = vanilla_supcon
-        self.ms_loss = ms_loss
-        self.ms_thresh = ms_thresh
-        self.ms_margin = ms_margin
-        self.ms_scale_pos = ms_scale_pos
-        self.ms_scale_neg = ms_scale_neg
         self.grafit = grafit
         self.grafit_lam = grafit_lam
         # One memory-bank slot per training image, addressed by dataset index.
@@ -135,31 +110,21 @@ class ContrastiveExperiment(pl.LightningModule):
         ) if bucsfr else None
         # Latest dendrogram: {"im2cluster", "centroids", "density"}.
         self._bucsfr_clusters: Optional[Dict[str, torch.Tensor]] = None
-        self.cross_entropy = cross_entropy
-        self.supcon_soft_pos_tau = supcon_soft_pos_tau
-        self.denom_pos_weight = denom_pos_weight
-        self.tau_annealing = tau_annealing
-        self.supcon_tau_start = supcon_tau_start
-        self.supcon_tau_end = supcon_tau_end
-        if no_pos_weight_epoch < 0:
-            raise ValueError("no_pos_weight_epoch must be non-negative")
-        self.no_pos_weight_epoch = no_pos_weight_epoch
-        self.sinkhorn = sinkhorn
-        self.sinkhorn_iters = sinkhorn_iters
         self.train_cat = train_cat
         self.test_cats = list(test_cats) if test_cats else ["test"]
 
-        # CE + Hierarchical Prototype Attention. The hierarchy is latent and
-        # rebuilt from the evolving feature space every few epochs.
-        if use_hpa and not cross_entropy:
-            raise ValueError("use_hpa requires cross_entropy=True (CE is the only "
-                             "objective in this version).")
-        if hierarchy_warmup_epochs < 0:
-            raise ValueError("hierarchy_warmup_epochs must be non-negative")
+        # Hierarchical Prototype Attention. The hierarchy is latent and rebuilt
+        # from the evolving feature space every few epochs; the objective is
+        # cross-view agreement on the prototype assignment at every level.
         self.use_hpa = use_hpa
-        self.hierarchy_warmup_epochs = hierarchy_warmup_epochs
+        self.hpa_consistency_weight = hpa_consistency_weight
+        self.hpa_assign_tau = hpa_assign_tau
+        self.hpa_target_tau = hpa_target_tau
+        self.hpa_sinkhorn_iters = hpa_sinkhorn_iters
         self.hierarchy_update_interval = max(hierarchy_update_interval, 1)
         self.hierarchy_snapshot_dir = hierarchy_snapshot_dir
+        # Prototypes come from the slow teacher unless explicitly disabled.
+        self.hierarchy_ema = use_hpa and hierarchy_ema
         self.hierarchy_manager = HierarchyManager(
             num_levels=hpa_levels,
             metric=hierarchy_metric,
@@ -171,15 +136,14 @@ class ContrastiveExperiment(pl.LightningModule):
         self._hpa_diagnostics: Optional[Dict[str, torch.Tensor]] = None
 
         # Optional EMA "teacher": a momentum-updated copy of the model whose
-        # embeddings drive the soft-positive weights (decoupling the positive
-        # weighting from the noisy online embeddings).
+        # embeddings drive the momentum-key and prototype branches.
         if not 0.0 <= EMA_momentum < 1.0:
             raise ValueError("EMA_momentum must be in [0, 1)")
-        self.EMA_pos_weight = EMA_pos_weight
         self.EMA_momentum = EMA_momentum
         # Grafit's instance term needs the EMA target branch f_xi of Eq. 1;
-        # MaskCon needs the same branch as its momentum key encoder.
-        if EMA_pos_weight or grafit or supcon_inst or maskcon or bucsfr:
+        # MaskCon needs the same branch as its momentum key encoder; HPA uses it
+        # to keep consecutive hierarchies anchored to a slowly moving space.
+        if grafit or maskcon or bucsfr or self.hierarchy_ema:
             self.ema_model = copy.deepcopy(model)
             for p in self.ema_model.parameters():
                 p.requires_grad_(False)
@@ -203,25 +167,6 @@ class ContrastiveExperiment(pl.LightningModule):
             ema_p.mul_(m).add_(p.detach(), alpha=1.0 - m)
         for ema_b, b in zip(self.ema_model.buffers(), self.model.buffers()):
             ema_b.copy_(b)
-
-    @torch.no_grad()
-    def _ema_pos_weight_sim(self, images: torch.Tensor,
-                            multiview: bool = False) -> Optional[torch.Tensor]:
-        """Cosine-similarity matrix from the EMA teacher's embeddings, used to
-        drive the soft-positive weights. Returns None when EMA weighting is off
-        or the current epoch still uses uniform positive weights. With
-        ``multiview`` the similarity is averaged over all view pairs instead of
-        being taken from view 0 alone."""
-        if not self.EMA_pos_weight or not self._use_pos_weighting():
-            return None
-        if images.ndim == 5:
-            if multiview:
-                b, v = images.shape[:2]
-                ema_views = self.ema_model(images.flatten(0, 1)).view(b, v, -1)
-                return multiview_similarity(ema_views)
-            images = images[:, 0]
-        ema_emb = self.ema_model(images)  # normalized embeddings
-        return ema_emb @ ema_emb.t()
 
     def _byol_views(self, images: torch.Tensor):
         """Encode a (B, V, C, H, W) batch into the online embedding of view 0
@@ -309,7 +254,7 @@ class ContrastiveExperiment(pl.LightningModule):
             return
         self._refresh_bucsfr_dendrogram()
 
-    # ── CE + Hierarchical Prototype Attention ────────────────────────────────
+    # ── Hierarchical Prototype Attention ─────────────────────────────────────
     # Information-leakage contract: everything below may read the image, the
     # coarse training label and the dataset index. Fine-grained / evaluation
     # labels (batch[2] of the datasets) are never touched here.
@@ -317,15 +262,19 @@ class ContrastiveExperiment(pl.LightningModule):
     def _should_refresh_hierarchy(self) -> bool:
         if not self.use_hpa:
             return False
-        elapsed = self.current_epoch - self.hierarchy_warmup_epochs
-        return elapsed >= 0 and elapsed % self.hierarchy_update_interval == 0
+        return self.current_epoch % self.hierarchy_update_interval == 0
 
     def _hpa_active(self) -> bool:
         return self.use_hpa and self.prototype_bank.is_ready
 
     @torch.no_grad()
     def _encode_train_set(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Base (HPA-free) normalized embeddings and coarse labels of the train set."""
+        """Base (HPA-free) normalized embeddings and coarse labels of the train set.
+
+        The momentum teacher encodes them when available: its weights move
+        slowly, so consecutive dendrograms describe the same feature space
+        instead of chasing the online encoder.
+        """
         from torch.utils.data import DataLoader
 
         datamodule = self.trainer.datamodule
@@ -343,14 +292,16 @@ class ContrastiveExperiment(pl.LightningModule):
             pin_memory=True,
         )
 
+        encoder = self.ema_model if self.hierarchy_ema else self.model
         features = torch.zeros(len(dataset), self.model.output_dim,
                                dtype=torch.float32, device=self.device)
         labels = torch.zeros(len(dataset), dtype=torch.long, device=self.device)
-        was_training = self.model.training
-        self.model.eval()
+        was_training = encoder.training
+        encoder.eval()
         for batch in progress_bar(
                 loader,
-                f"[HPA] encoding train set (epoch {self.current_epoch})"):
+                f"[HPA] encoding train set (epoch {self.current_epoch}, "
+                f"{'EMA' if self.hierarchy_ema else 'online'} encoder)"):
             # Positional access only: batch[2] holds evaluation labels and must
             # not reach the hierarchy.
             images, coarse_labels, idx = batch[0], batch[1], batch[-1]
@@ -358,9 +309,9 @@ class ContrastiveExperiment(pl.LightningModule):
             if images.ndim == 5:
                 images = images[:, 0]
             idx = idx.to(self.device)
-            features[idx] = self.model.encode(images, normalize=True).float()
+            features[idx] = encoder.encode(images, normalize=True).float()
             labels[idx] = coarse_labels.view(-1).to(self.device)
-        self.model.train(was_training)
+        encoder.train(was_training)
         return features, labels
 
     @torch.no_grad()
@@ -395,30 +346,58 @@ class ContrastiveExperiment(pl.LightningModule):
                 self.hierarchy_snapshot_dir,
                 f"hierarchy_epoch{self.current_epoch:04d}.npz"))
 
-    def _prototype_fn(self, sample_idx: Optional[torch.Tensor]
-                      ) -> Callable[[torch.Tensor], torch.Tensor]:
-        """Prototype retrieval closure for one batch.
+    def _hpa_views(self, images: torch.Tensor
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Student (HPA-refined) and momentum-teacher embeddings, both (B, V, D).
 
-        Training samples are members of the hierarchy, so their own ancestors
-        are gathered by dataset index. Held-out images have no membership, so
-        each level falls back to its nearest prototype (no labels involved).
+        The prototype context is retrieved by nearest neighbour in both phases:
+        using the sample's own ancestors would feed the model a class-pure
+        context, i.e. the coarse label through a side channel, and the held-out
+        path could not reproduce it.
         """
-        if self.training and sample_idx is not None:
-            idx = sample_idx.reshape(-1)
-            return lambda _z: self.prototype_bank.lookup(idx)
-        return self.prototype_bank.lookup_nearest
+        if images.ndim != 5:
+            images = images.unsqueeze(1)
+        b, v = images.shape[:2]
+        flat = images.flatten(0, 1)
 
-    def _encode_for_ce(self, images: torch.Tensor,
-                       sample_idx: Optional[torch.Tensor]) -> torch.Tensor:
-        """Embedding fed to the CE classifier: z (baseline) or z~ (CE + HPA)."""
-        if images.ndim == 5:
-            images = images[:, 0]
-        if not self._hpa_active():
+        if self._hpa_active():
+            z, self._hpa_diagnostics = self.model.encode_with_hpa(
+                flat, self.prototype_bank.lookup_nearest)
+        else:
             self._hpa_diagnostics = None
-            return self.model(images)
-        embeddings, self._hpa_diagnostics = self.model.encode_with_hpa(
-            images, self._prototype_fn(sample_idx))
-        return embeddings
+            z = self.model.encode(flat, normalize=True)
+        student = z.view(b, v, -1)
+
+        with torch.no_grad():
+            teacher = (self.ema_model.encode(flat, normalize=True).view(b, v, -1)
+                       if self.ema_model is not None else student.detach())
+        return student, teacher
+
+    def _hpa_step(self, images: torch.Tensor
+                  ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """Multi-granularity assignment consistency across augmented views.
+
+        The coarse labels only shape the hierarchy the prototypes come from;
+        the loss itself never sees them. The sanity-check validation pass runs
+        before the first hierarchy is built, so that case yields no gradient.
+        """
+        student, teacher = self._hpa_views(images)
+        embeddings = student[:, 0]
+
+        if not self._hpa_active():
+            return {"loss": embeddings.sum() * 0.0,
+                    "hpa_active": torch.zeros((), device=embeddings.device)}, embeddings
+
+        loss_dict = self.model.hpa_consistency_loss_function(
+            student, teacher,
+            level_prototypes=self.prototype_bank.slot_prototypes,
+            student_tau=self.hpa_assign_tau,
+            target_tau=self.hpa_target_tau,
+            sinkhorn_iters=self.hpa_sinkhorn_iters,
+        )
+        loss_dict["loss"] = self.hpa_consistency_weight * loss_dict["loss"]
+        loss_dict["hpa_active"] = torch.ones((), device=embeddings.device)
+        return loss_dict, embeddings
 
     def _log_hpa_diagnostics(self, stage: str) -> None:
         diag = self._hpa_diagnostics
@@ -433,33 +412,8 @@ class ContrastiveExperiment(pl.LightningModule):
         self.log_dict(metrics, on_step=False, on_epoch=True,
                       sync_dist=(stage == "val"))
 
-    def _multi_views(self, images: torch.Tensor):
-        """Encode a (B, V, C, H, W) batch into the view-0 embedding plus the
-        full (B, V, D) view stack used for the augmentation-averaged positive
-        similarities. Single-view batches yield a V=1 stack."""
-        if images.ndim != 5:
-            embeddings = self.model(images)
-            return embeddings, embeddings.unsqueeze(1)
-        b, v = images.shape[:2]
-        view_embeddings = self.model(images.flatten(0, 1)).view(b, v, -1)
-        return view_embeddings[:, 0], view_embeddings
-
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
-
-    def _current_supcon_tau(self) -> float:
-        if not self.tau_annealing:
-            return self.supcon_soft_pos_tau
-        weighted_epoch = max(self.current_epoch - self.no_pos_weight_epoch, 0)
-        weighted_epochs = max(self.max_epochs - self.no_pos_weight_epoch, 1)
-        progress = min(weighted_epoch / max(weighted_epochs - 1, 1), 1.0)
-        return self.supcon_tau_start + (
-            self.supcon_tau_end - self.supcon_tau_start
-        ) * progress
-
-    def _use_pos_weighting(self) -> bool:
-        return self.current_epoch >= self.no_pos_weight_epoch
 
     def _step(self, batch: Any) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # Support both (images, labels) and (images, train_labels, test_labels).
@@ -476,22 +430,7 @@ class ContrastiveExperiment(pl.LightningModule):
             images, labels = batch
             test_labels = None
 
-        if test_labels is not None and test_labels.ndim > 1:
-            loss_test_labels = test_labels[:, 0]
-        else:
-            loss_test_labels = test_labels
-
-        if self.vanilla_supcon:
-            embeddings = self.model(images)
-            loss_dict = self.model.vanilla_supcon_loss_function(
-                embeddings, labels, temperature=self.temperature)
-        elif self.ms_loss:
-            embeddings = self.model(images)
-            loss_dict = self.model.ms_loss_function(
-                embeddings, labels, thresh=self.ms_thresh,
-                margin=self.ms_margin, scale_pos=self.ms_scale_pos,
-                scale_neg=self.ms_scale_neg)
-        elif self.grafit:
+        if self.grafit:
             # Multi-view train batches are (B, V, C, H, W); val stays
             # (B, C, H, W), where only the coarse kNN term is defined.
             embeddings, predictions, targets = self._byol_views(images)
@@ -525,62 +464,27 @@ class ContrastiveExperiment(pl.LightningModule):
                          if self._bucsfr_clusters else None),
                 queue=self.bucsfr_queue,
                 update_queue=self.training)
-        elif self.supcon_softpos:
-            if self.supcon_inst:
-                embeddings, predictions, targets = self._byol_views(images)
-            else:
-                embeddings, predictions, targets = self.model(images), None, None
-            supcon_tau = self._current_supcon_tau()
-            loss_dict = self.model.supcon_soft_pos_loss_function(
-                embeddings, labels, temperature=self.temperature,
-                pos_weight_tau=supcon_tau,
-                use_pos_weighting=self._use_pos_weighting(),
-                pos_weight_sim=self._ema_pos_weight_sim(images),
-                predictions=predictions, targets=targets,
-                inst_weight=self.supcon_inst_weight,
-                test_labels=loss_test_labels)
-        elif self.taxocon_aug:
-            # Train batches are (B, V, C, H, W): the extra views only feed the
-            # positive-weight similarities, the SupCon term stays on view 0.
-            embeddings, view_embeddings = self._multi_views(images)
-            loss_dict = self.model.taxocon_aug_loss_function(
-                embeddings, labels, temperature=self.temperature,
-                pos_weight_tau=self._current_supcon_tau(),
-                use_pos_weighting=self._use_pos_weighting(),
-                view_embeddings=view_embeddings,
-                pos_weight_sim=self._ema_pos_weight_sim(images, multiview=True),
-                test_labels=loss_test_labels)
-        elif self.cross_entropy:
-            # Supervised cross-entropy baseline: a linear classifier on the same
-            # normalized embedding the contrastive losses operate on. With HPA
-            # the classifier sees the prototype-refined embedding instead.
-            embeddings = self._encode_for_ce(images, sample_idx)
-            loss_dict = self.model.ce_loss_function(embeddings, labels)
+        elif self.use_hpa:
+            # Hierarchical Prototype Attention: cross-view agreement on the
+            # latent hierarchy, at every granularity.
+            loss_dict, embeddings = self._hpa_step(images)
         else:
-            embeddings = self.model(images)
-            loss_dict = self.model.loss_function(
-                embeddings, labels, temperature=self.temperature)
+            raise RuntimeError(
+                "No training objective selected: pass one of --maskcon, "
+                "--grafit, --bucsfr or --use_hpa.")
 
         return loss_dict, embeddings, labels, test_labels
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         loss_dict, _, _, _ = self._step(batch)
         self._log_hpa_diagnostics("train")
-        if self.supcon_softpos or self.taxocon_aug:
-            self.log("train_supcon_tau", self._current_supcon_tau(),
-                     on_step=False, on_epoch=True)
-        if self.supcon_softpos or self.taxocon_aug:
-            self.log("train_pos_weight_active", float(self._use_pos_weighting()),
-                     on_step=False, on_epoch=True)
         self.log(
             "train_loss", loss_dict["loss"],
             on_step=True, on_epoch=True, prog_bar=True,
         )
-        for key in ("suspicion_mean", "suspicion_same_testcat", "suspicion_diff_testcat",
-                    "pos_weight_same_testcat", "pos_weight_diff_testcat",
-                    "pos_weight_testcat_ratio", "ce_top1", "ce_top5"):
-            if key in loss_dict:
-                self.log(f"train_{key}", loss_dict[key], on_step=True, on_epoch=True)
+        for key, value in loss_dict.items():
+            if key in ("ce_top1", "ce_top5") or key.startswith("hpa_"):
+                self.log(f"train_{key}", value, on_step=True, on_epoch=True)
         return loss_dict["loss"]
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
@@ -601,10 +505,9 @@ class ContrastiveExperiment(pl.LightningModule):
             "val_loss", loss_dict["loss"],
             on_step=False, on_epoch=True, prog_bar=True, sync_dist=True,
         )
-        for key in ("pos_weight_same_testcat", "pos_weight_diff_testcat",
-                    "pos_weight_testcat_ratio", "ce_top1", "ce_top5"):
-            if key in loss_dict:
-                self.log(f"val_{key}", loss_dict[key], on_step=False, on_epoch=True,
+        for key, value in loss_dict.items():
+            if key in ("ce_top1", "ce_top5") or key.startswith("hpa_"):
+                self.log(f"val_{key}", value, on_step=False, on_epoch=True,
                          sync_dist=True)
         if test_labels is not None:
             self._val_embeddings.append(embeddings.detach().cpu())

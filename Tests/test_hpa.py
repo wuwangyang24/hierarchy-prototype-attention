@@ -1,8 +1,8 @@
-"""Sanity checks for CE + Hierarchical Prototype Attention.
+"""Sanity checks for Hierarchical Prototype Attention.
 
 Run with ``pytest Tests/test_hpa.py``. These tests exercise the hierarchy,
-the prototype bank and the attention block without touching timm/ImageNet
-weights, so they are fast and offline.
+the prototype bank, the attention block and the multi-granularity consistency
+loss without touching timm/ImageNet weights, so they are fast and offline.
 """
 
 import inspect
@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from Hierarchy import HierarchyManager, PrototypeBank
+from Loss import hpa_consistency_loss
 from Models.hpa import HierarchicalPrototypeAttention
 
 DIM = 16
@@ -147,9 +148,8 @@ def test_gradients_reach_encoder_projections_and_gamma():
     assert protos.grad is None
 
 
-def test_hpa_disabled_is_the_plain_ce_path():
+def test_hpa_disabled_leaves_the_encoder_untouched():
     """Without an HPA block the encode path is untouched and z~ == z."""
-
     class TinyBackbone(nn.Module):
         def __init__(self, use_hpa):
             super().__init__()
@@ -168,3 +168,37 @@ def test_hpa_disabled_is_the_plain_ce_path():
     protos = F.normalize(torch.randn(4, NUM_LEVELS, DIM), dim=-1)
     refined, _ = with_hpa.hpa(with_hpa.encode(x), protos)
     assert torch.allclose(baseline.encode(x), refined, atol=1e-6)
+
+
+# ── Multi-granularity consistency loss ───────────────────────────────────────
+
+def _level_prototypes(snapshot):
+    protos = torch.as_tensor(snapshot.prototypes)
+    return [protos[torch.as_tensor(rows.copy())] for rows in snapshot.slot_rows]
+
+
+def test_consistency_loss_is_lower_when_views_agree(snapshot):
+    levels = _level_prototypes(snapshot)
+    torch.manual_seed(0)
+    z = F.normalize(torch.randn(8, DIM), dim=1)
+
+    agree = torch.stack([z, z], dim=1)
+    disagree = torch.stack([z, z.flip(0)], dim=1)
+    same = hpa_consistency_loss(agree, agree, levels)["loss"]
+    different = hpa_consistency_loss(disagree, disagree, levels)["loss"]
+    assert same < different
+
+
+def test_consistency_loss_uses_no_labels():
+    params = set(inspect.signature(hpa_consistency_loss).parameters)
+    assert not any("label" in p for p in params)
+
+
+def test_consistency_gradients_reach_the_student_only(snapshot):
+    levels = _level_prototypes(snapshot)
+    student = F.normalize(torch.randn(6, 2, DIM), dim=-1).requires_grad_(True)
+    teacher = F.normalize(torch.randn(6, 2, DIM), dim=-1).requires_grad_(True)
+
+    hpa_consistency_loss(student, teacher, levels)["loss"].backward()
+    assert student.grad is not None and student.grad.abs().sum() > 0
+    assert teacher.grad is None

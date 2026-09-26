@@ -11,15 +11,10 @@ from pytorch_lightning.loggers import WandbLogger
 class BestValLossReporter(Callback):
     """Track the epoch with the lowest ``val_loss`` and, at the end of
     training, print a table of the Recall@k / linear-probe metrics recorded at
-    that epoch together with the positive-weight temperature and Sinkhorn
-    settings."""
+    that epoch."""
 
-    def __init__(self, pos_weight_tau, sinkhorn: bool, sinkhorn_iters: int,
-                 stats_dir: str, report_name: str) -> None:
+    def __init__(self, stats_dir: str, report_name: str) -> None:
         super().__init__()
-        self.pos_weight_tau = pos_weight_tau
-        self.sinkhorn = sinkhorn
-        self.sinkhorn_iters = sinkhorn_iters
         self.stats_dir = stats_dir
         self.report_name = report_name
         self.best_val_loss = float("inf")
@@ -88,19 +83,10 @@ class BestValLossReporter(Callback):
         def render(cells):
             return " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells))
 
-        tau_str = (
-            f"{self.pos_weight_tau:.4g}"
-            if isinstance(self.pos_weight_tau, (int, float))
-            else str(self.pos_weight_tau)
-        )
-        sinkhorn_str = f"yes ({self.sinkhorn_iters} iters)" if self.sinkhorn else "no"
-
         lines = [
             "",
             "=" * max(60, sum(widths) + 3 * (len(widths) - 1)),
             f"Best val_loss: {self.best_val_loss:.6f} @ epoch {self.best_epoch}",
-            f"Positive-weight Tau: {tau_str}",
-            f"Sinkhorn: {sinkhorn_str}",
             "-" * max(60, sum(widths) + 3 * (len(widths) - 1)),
         ]
         if rows:
@@ -225,7 +211,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj_hidden_dim", type=int, default=2048,
                         help="Hidden width of the 2-layer projection MLP")
     parser.add_argument("--temperature", type=float, default=0.1,
-                        help="Softmax temperature for the SupCon loss")
+                        help="Softmax temperature for the contrastive losses")
     parser.add_argument("--use_proj_head", action="store_true",
                         help="Use the projection head on top of the backbone features. "
                              "If not set, the backbone features are directly L2-normalized.")
@@ -234,17 +220,33 @@ def parse_args() -> argparse.Namespace:
                              "to trade extra compute for lower memory (allows larger "
                              "batches). Only used with --model backbone.")
 
-    # CE + Hierarchical Prototype Attention (requires --cross_entropy)
+    # Hierarchical Prototype Attention (standalone objective)
     parser.add_argument("--use_hpa", action="store_true",
-                        help="Refine the final embedding with Hierarchical Prototype "
-                             "Attention before the CE classifier. The hierarchy is "
-                             "discovered from coarse labels only. Without this flag "
-                             "the run is the plain CE baseline.")
+                        help="Train with Hierarchical Prototype Attention: the "
+                             "embedding is refined by prototypes of a hierarchy "
+                             "discovered from coarse labels only, and the objective "
+                             "is cross-view agreement on the prototype assignment "
+                             "at every granularity.")
     parser.add_argument("--hpa_levels", type=int, default=3,
                         help="Number L of ancestor prototypes each image attends to "
                              "(local -> intermediate -> broad). Default: 3")
     parser.add_argument("--hpa_heads", type=int, default=1,
                         help="Attention heads in the HPA block. Default: 1")
+    parser.add_argument("--hpa_views", type=int, default=2,
+                        help="Augmented views per image compared by the assignment "
+                             "consistency loss. Default: 2")
+    parser.add_argument("--hpa_consistency_weight", type=float, default=1.0,
+                        help="Weight of the multi-granularity assignment "
+                             "consistency term. Default: 1.0")
+    parser.add_argument("--hpa_assign_tau", type=float, default=0.1,
+                        help="Temperature of the student prototype assignment. "
+                             "Default: 0.1")
+    parser.add_argument("--hpa_target_tau", type=float, default=0.04,
+                        help="Temperature of the teacher (target) assignment; keep "
+                             "it below --hpa_assign_tau. Default: 0.04")
+    parser.add_argument("--hpa_sinkhorn_iters", type=int, default=3,
+                        help="Sinkhorn iterations balancing the targets over the "
+                             "batch (0 disables, risking collapse). Default: 3")
     parser.add_argument("--hpa_gamma", type=float, default=0.0,
                         help="Residual scale of the prototype context. Initial value "
                              "of the learned scalar, or the fixed value when "
@@ -254,12 +256,9 @@ def parse_args() -> argparse.Namespace:
                              "instead of learning it.")
     parser.add_argument("--hpa_no_layernorm", action="store_true",
                         help="Disable the LayerNorm on the HPA prototype context.")
-    parser.add_argument("--hierarchy_warmup_epochs", type=int, default=5,
-                        help="CE-only epochs before the first hierarchy is built "
-                             "(HPA is inactive until then). Default: 5")
     parser.add_argument("--hierarchy_update_interval", type=int, default=5,
-                        help="Rebuild the hierarchy and prototypes every N epochs "
-                             "after warm-up. Default: 5")
+                        help="Rebuild the hierarchy and prototypes every N epochs. "
+                             "Default: 5")
     parser.add_argument("--hierarchy_metric", type=str, default="cosine",
                         help="Pairwise distance for the agglomerative clustering")
     parser.add_argument("--hierarchy_linkage", type=str, default="average",
@@ -274,63 +273,11 @@ def parse_args() -> argparse.Namespace:
                              "clustering is quadratic, so cap this (e.g. 10000) when "
                              "a coarse class holds tens of thousands of images. "
                              "Default: no cap.")
+    parser.add_argument("--hierarchy_no_ema", action="store_true",
+                        help="Build the hierarchy from the online encoder instead of "
+                             "the EMA teacher (momentum: --EMA_momentum).")
 
     # Losses
-    parser.add_argument("--supcon_soft_pos_loss", action="store_true",
-                        help="Use supervised contrastive (SupCon) loss with "
-                             "similarity-weighted positives: positive pairs that are "
-                             "more similar get larger weight, forming tighter "
-                             "sub-clusters.")
-    parser.add_argument("--supcon_soft_pos_tau", type=float, default=0.1,
-                        help="Temperature for the positive-pair softmax weighting in "
-                             "--supcon_soft_pos_loss (lower = more weight on closest "
-                             "positives). Default: 0.1")
-    parser.add_argument("--supcon_inst", action="store_true",
-                        help="Add Grafit's BYOL-style instance-level term to "
-                             "--supcon_soft_pos_loss. Needs multi-view batches "
-                             "(--grafit_views) and adds an EMA target network.")
-    parser.add_argument("--supcon_inst_weight", type=float, default=1.0,
-                        help="Weight of the instance term in "
-                             "L_supcon + w * L_inst. Default: 1.0")
-    parser.add_argument("--taxocon_aug", action="store_true",
-                        help="Use TaxoCon-Aug: the SupCon soft-positive loss whose "
-                             "positive-pair weights come from the similarity averaged "
-                             "over augmented views (--grafit_views) instead of a "
-                             "single view. Shares --supcon_soft_pos_tau, "
-                             "--tau_annealing and --denominator_pos_weight.")
-    parser.add_argument("--denominator_pos_weight", action="store_true",
-                        help="With --supcon_soft_pos_loss, also re-weight the positive "
-                             "terms inside the SupCon denominator by the soft positive "
-                             "weights (negatives stay at weight 1).")
-    parser.add_argument("--tau_annealing", action="store_true",
-                        help="Linearly anneal the SupCon soft-positive temperature from "
-                             "--supcon_tau_start to --supcon_tau_end over training.")
-    parser.add_argument("--supcon_tau_start", type=float, default=0.1,
-                        help="Initial SupCon soft-positive temperature when "
-                             "--tau_annealing is enabled. Default: 0.1")
-    parser.add_argument("--supcon_tau_end", type=float, default=0.1,
-                        help="Final SupCon soft-positive temperature when "
-                             "--tau_annealing is enabled. Default: 0.1")
-    parser.add_argument("--no_pos_weight_epoch", type=int, default=0,
-                        help="Number of initial epochs that use uniform positive "
-                            "weights before SupCon soft-positive weighting "
-                            "starts. "
-                             "Default: 0")
-    parser.add_argument("--vanilla_supcon", action="store_true",
-                        help="Use the plain Supervised Contrastive (SupCon) loss (no "
-                             "soft positives): supervised single-view "
-                             "SupCon with the coupled denominator.")
-    parser.add_argument("--ms_loss", action="store_true",
-                        help="Use the Multi-Similarity loss (Wang et al., CVPR 2019) "
-                             "with pair mining, as in the official MS-Loss repo.")
-    parser.add_argument("--ms_thresh", type=float, default=0.5,
-                        help="Multi-Similarity similarity offset (lambda). Default: 0.5")
-    parser.add_argument("--ms_margin", type=float, default=0.1,
-                        help="Multi-Similarity pair-mining margin (epsilon). Default: 0.1")
-    parser.add_argument("--ms_scale_pos", type=float, default=2.0,
-                        help="Multi-Similarity positive scale (alpha). Default: 2.0")
-    parser.add_argument("--ms_scale_neg", type=float, default=40.0,
-                        help="Multi-Similarity negative scale (beta). Default: 40.0")
     parser.add_argument("--grafit", action="store_true",
                         help="Use the Grafit loss (Touvron et al., 2020): the coarse "
                              "kNN/NCA loss plus a BYOL-style instance-level term over "
@@ -390,26 +337,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucsfr_refresh_every", type=int, default=1,
                         help="Rebuild the dendrogram (and merge one pair per coarse "
                              "class) every N epochs after warmup. Default: 1")
-    parser.add_argument("--cross_entropy", action="store_true",
-                        help="Supervised cross-entropy baseline: train a linear "
-                             "classifier on the (normalized) embedding over the "
-                             "train-label classes. Discarded at eval; kNN / "
-                             "linear-probe still run on the embeddings.")
-    parser.add_argument("--sinkhorn", action="store_true",
-                        help="Use Sinkhorn-Knopp iterations to produce a doubly-stochastic "
-                             "positive weight matrix instead of row-wise softmax. "
-                             "Only used with the soft-positive losses.")
-    parser.add_argument("--sinkhorn_iters", type=int, default=5,
-                        help="Number of Sinkhorn-Knopp iterations. Default: 5")
-    parser.add_argument("--EMA_pos_weight", action="store_true",
-                        help="Compute the soft-positive weights from an EMA "
-                             "(momentum-updated) teacher copy of the model instead "
-                             "of the online embeddings. Used with "
-                             "--supcon_soft_pos_loss or --taxocon_aug.")
     parser.add_argument("--EMA_momentum", type=float, default=0.999,
-                        help="Momentum for the EMA teacher weight update when "
-                             "--EMA_pos_weight is set (ema = m*ema + (1-m)*online). "
-                             "Default: 0.999")
+                        help="Momentum for the EMA teacher weight update "
+                             "(ema = m*ema + (1-m)*online). Default: 0.999")
 
     # Optimization
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -480,24 +410,19 @@ def main() -> None:
     if not args.deterministic:
         torch.backends.cudnn.benchmark = True
 
-    if args.taxocon_aug and args.supcon_soft_pos_loss:
+    objectives = [args.maskcon, args.grafit, args.bucsfr, args.use_hpa]
+    if sum(objectives) != 1:
         raise ValueError(
-            "--taxocon_aug and --supcon_soft_pos_loss are mutually exclusive: "
-            "TaxoCon-Aug is the multi-view variant of the SupCon soft-positive "
-            "loss. Pass only --taxocon_aug (it reuses --supcon_soft_pos_tau)."
-        )
-
-    if args.use_hpa and not args.cross_entropy:
-        raise ValueError(
-            "--use_hpa requires --cross_entropy: CE is the only training "
-            "objective in this version of Hierarchical Prototype Attention."
+            "Exactly one training objective is required: pass one of "
+            "--maskcon, --grafit, --bucsfr or --use_hpa."
         )
 
     # Multi-view batches are only meaningful for the instance-level term.
-    supcon_inst = args.supcon_soft_pos_loss and args.supcon_inst
-    use_instance_term = args.grafit or supcon_inst
     grafit_views = args.grafit_views if (
-        use_instance_term or args.taxocon_aug or args.maskcon or args.bucsfr) else 0
+        args.grafit or args.maskcon or args.bucsfr) else 0
+    # HPA compares augmented views, so it needs at least two of them.
+    if args.use_hpa:
+        grafit_views = max(grafit_views, args.hpa_views)
     # BuCSFR needs the dataset index to look up each sample's dendrogram cluster.
     grafit_bank = (args.grafit and args.grafit_bank) or args.bucsfr
 
@@ -539,17 +464,16 @@ def main() -> None:
             seed=args.seed,
         )
 
-    # The cross-entropy baseline needs the number of training-label classes
-    # up front to size its linear classifier head, and Grafit's memory bank
-    # needs one slot per training image. setup() is idempotent; Lightning
-    # calls it again internally during fit().
+    # BuCSFR's auxiliary classifier needs the number of training-label classes
+    # up front, and Grafit's memory bank needs one slot per training image.
+    # setup() is idempotent; Lightning calls it again internally during fit().
     num_classes = None
     grafit_bank_size = 0
-    if args.cross_entropy or grafit_bank:
+    if grafit_bank:
         datamodule.setup()
         grafit_bank_size = (len(datamodule.train_dataset)
                             if (args.grafit and args.grafit_bank) else 0)
-    if args.cross_entropy or args.bucsfr:
+    if args.bucsfr:
         num_classes = datamodule.num_train_classes
 
     model = Backbone(
@@ -559,16 +483,10 @@ def main() -> None:
         proj_hidden_dim=args.proj_hidden_dim,
         temperature=args.temperature,
         use_proj_head=args.use_proj_head,
-        supcon_soft_pos=args.supcon_soft_pos_loss,
-        supcon_soft_pos_tau=args.supcon_soft_pos_tau,
-        supcon_denom_pos_weight=args.denominator_pos_weight,
-        taxocon_aug=args.taxocon_aug,
-        sinkhorn=args.sinkhorn,
-        sinkhorn_iters=args.sinkhorn_iters,
         grad_checkpointing=args.grad_checkpointing,
         num_classes=num_classes,
-        cross_entropy=args.cross_entropy or args.bucsfr,
-        grafit_predictor=use_instance_term,
+        aux_classifier=args.bucsfr,
+        grafit_predictor=args.grafit,
         use_hpa=args.use_hpa,
         hpa_heads=args.hpa_heads,
         hpa_gamma=args.hpa_gamma,
@@ -585,12 +503,6 @@ def main() -> None:
         scheduler=args.scheduler,
         warmup_epochs=args.warmup_epochs,
         max_epochs=args.epochs,
-        vanilla_supcon=args.vanilla_supcon,
-        ms_loss=args.ms_loss,
-        ms_thresh=args.ms_thresh,
-        ms_margin=args.ms_margin,
-        ms_scale_pos=args.ms_scale_pos,
-        ms_scale_neg=args.ms_scale_neg,
         grafit=args.grafit,
         grafit_lam=args.grafit_lam,
         grafit_bank_size=grafit_bank_size,
@@ -605,30 +517,20 @@ def main() -> None:
         bucsfr_threshold=args.bucsfr_threshold,
         bucsfr_warmup_epochs=args.bucsfr_warmup_epochs,
         bucsfr_refresh_every=args.bucsfr_refresh_every,
-        supcon_softpos=args.supcon_soft_pos_loss,
-        supcon_inst=supcon_inst,
-        supcon_inst_weight=args.supcon_inst_weight,
-        taxocon_aug=args.taxocon_aug,
-        cross_entropy=args.cross_entropy,
-        supcon_soft_pos_tau=args.supcon_soft_pos_tau,
-        denom_pos_weight=args.denominator_pos_weight,
-        tau_annealing=args.tau_annealing,
-        supcon_tau_start=args.supcon_tau_start,
-        supcon_tau_end=args.supcon_tau_end,
-        no_pos_weight_epoch=args.no_pos_weight_epoch,
-        sinkhorn=args.sinkhorn,
-        sinkhorn_iters=args.sinkhorn_iters,
-        EMA_pos_weight=args.EMA_pos_weight,
         EMA_momentum=args.EMA_momentum,
         use_hpa=args.use_hpa,
         hpa_levels=args.hpa_levels,
-        hierarchy_warmup_epochs=args.hierarchy_warmup_epochs,
+        hpa_consistency_weight=args.hpa_consistency_weight,
+        hpa_assign_tau=args.hpa_assign_tau,
+        hpa_target_tau=args.hpa_target_tau,
+        hpa_sinkhorn_iters=args.hpa_sinkhorn_iters,
         hierarchy_update_interval=args.hierarchy_update_interval,
         hierarchy_metric=args.hierarchy_metric,
         hierarchy_linkage=args.hierarchy_linkage,
         hierarchy_snapshot_dir=args.hierarchy_snapshot_dir,
         hierarchy_max_samples_per_class=args.hierarchy_max_samples_per_class,
         hierarchy_seed=args.seed,
+        hierarchy_ema=not args.hierarchy_no_ema,
         train_cat=args.train_cat,
         test_cats=args.test_cat,
     )
@@ -652,17 +554,12 @@ def main() -> None:
         "convnext_tiny": "ConvNeXtT",
     }.get(args.backbone, args.backbone)
     model_prefix = f"FFT_{backbone_tag}"
-    ema_pw_tag = f"-EMA{args.EMA_momentum}" if args.EMA_pos_weight else ""
-    vanilla_supcon_tag = "_VanillaSupCon" if args.vanilla_supcon else ""
-    ms_loss_tag = (
-        f"_MS-L{args.ms_thresh}-M{args.ms_margin}"
-        f"-A{args.ms_scale_pos}-B{args.ms_scale_neg}"
-    ) if args.ms_loss else ""
-    cross_entropy_tag = "_CrossEntropy" if args.cross_entropy else ""
     hpa_tag = (
         f"_HPA-L{args.hpa_levels}-H{args.hpa_heads}"
         f"-G{args.hpa_gamma}{'fix' if args.hpa_fixed_gamma else ''}"
-        f"-W{args.hierarchy_warmup_epochs}-E{args.hierarchy_update_interval}"
+        f"-E{args.hierarchy_update_interval}"
+        f"-Views{args.hpa_views}-CW{args.hpa_consistency_weight}"
+        f"-Ts{args.hpa_assign_tau}-Tt{args.hpa_target_tau}"
     ) if args.use_hpa else ""
     grafit_tag = (
         f"_Grafit-Lam{args.grafit_lam}-Views{args.grafit_views}"
@@ -679,36 +576,15 @@ def main() -> None:
         f"-Q{args.bucsfr_queue_size}-Views{args.grafit_views}"
         f"-M{args.EMA_momentum}"
     ) if args.bucsfr else ""
-    supcon_softpos_tag = (
-        f"_SupConSoftPos-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
-        f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
-        f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
-        f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
-        f"{'-Inst' + str(args.supcon_inst_weight) + 'Views' + str(args.grafit_views) if args.supcon_inst else ''}"
-        f"{ema_pw_tag}"
-    ) if args.supcon_soft_pos_loss else ""
-    taxocon_aug_tag = (
-        f"_TaxoConAug-{'LinearTau' + str(args.supcon_tau_start) + 'to' + str(args.supcon_tau_end) if args.tau_annealing else 'Tau' + str(args.supcon_soft_pos_tau)}"
-        f"-Views{args.grafit_views}"
-        f"{'-NoPosWeight' + str(args.no_pos_weight_epoch) if args.no_pos_weight_epoch else ''}"
-        f"{'-DenomPosW' if args.denominator_pos_weight else ''}"
-        f"{'-Sinkhorn' + str(args.sinkhorn_iters) if args.sinkhorn else ''}"
-        f"{ema_pw_tag}"
-    ) if args.taxocon_aug else ""
     ckpt_suffix = (
         f"{model_prefix}"
         f"_BS{args.batch_size}"
         f"_{proj_tag}"
         f"_T{args.temperature}"
-        f"{vanilla_supcon_tag}"
-        f"{ms_loss_tag}"
         f"{grafit_tag}"
         f"{maskcon_tag}"
         f"{bucsfr_tag}"
-        f"{cross_entropy_tag}"
         f"{hpa_tag}"
-        f"{supcon_softpos_tag}"
-        f"{taxocon_aug_tag}"
         f"{dataset_tag}"
     )
 
@@ -760,21 +636,6 @@ def main() -> None:
 
     # Report the best-val-loss epoch's metrics as a table at the end of
     # training.
-    # The active soft-positive loss determines which temperature governs the
-    # positive-pair weighting.
-    if args.supcon_soft_pos_loss:
-        pos_weight_tau = (
-            f"{args.supcon_tau_start}->{args.supcon_tau_end}"
-            if args.tau_annealing else args.supcon_soft_pos_tau
-        )
-    elif args.taxocon_aug:
-        pos_weight_tau = (
-            f"{args.supcon_tau_start}->{args.supcon_tau_end}"
-            if args.tau_annealing else args.supcon_soft_pos_tau
-        )
-    else:
-        pos_weight_tau = "n/a"
-
     # Organise reports under <model>/<dataset>/ (e.g. resnet18/mammals/).
     model_folder = {
         "resnet18": "resnet18",
@@ -788,9 +649,6 @@ def main() -> None:
         dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
 
     callbacks.append(BestValLossReporter(
-        pos_weight_tau=pos_weight_tau,
-        sinkhorn=args.sinkhorn,
-        sinkhorn_iters=args.sinkhorn_iters,
         stats_dir=os.path.join(args.output_dir, "reports", model_folder, dataset_folder),
         report_name=f"{ckpt_suffix}_best_val_loss_report.txt",
     ))

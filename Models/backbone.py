@@ -8,9 +8,7 @@ from torch.nn import functional as F
 from .hpa import HierarchicalPrototypeAttention
 from Loss import (
     batch_knn_accuracy, gaussianity_metrics,
-    SupConSoftPosLoss, TaxoConAugLoss,
-    vanilla_supcon_loss, multi_similarity_loss, grafit_loss, maskcon_loss,
-    bucsfr_loss,
+    grafit_loss, maskcon_loss, bucsfr_loss, hpa_consistency_loss,
 )
 
 try:
@@ -29,7 +27,7 @@ _SUPPORTED_BACKBONES = (
 
 class Backbone(nn.Module):
     """Fully fine-tuned convolutional / ViT backbone with an optional projection
-    head for supervised contrastive (SupCon) representation learning.
+    head for contrastive representation learning.
 
     The entire backbone is trainable (full fine-tuning). ``forward`` returns
     L2-normalized embeddings suitable for a cosine-similarity contrastive
@@ -45,12 +43,12 @@ class Backbone(nn.Module):
         img_size: square input size fed to the backbone (any size >= 32).
         embedding_dim: dimension of the output (projected) embedding.
         proj_hidden_dim: hidden width of the 2-layer projection MLP.
-        temperature: softmax temperature for the SupCon loss.
+        temperature: softmax temperature for the contrastive losses.
         use_proj_head: if True, add a 2-layer MLP projection head on top of the
             backbone features; otherwise output the L2-normalized backbone
             features directly.
         use_hpa: add a Hierarchical Prototype Attention block on the final
-            embedding. When False the model is the untouched CE/SupCon baseline.
+            embedding. When False the model is the untouched contrastive baseline.
         hpa_heads: attention heads of the HPA block.
         hpa_gamma: HPA residual scale (initial value when it is learned).
         hpa_learn_gamma: learn the residual scale instead of fixing it.
@@ -68,15 +66,9 @@ class Backbone(nn.Module):
                  proj_hidden_dim: int = 2048,
                  temperature: float = 0.1,
                  use_proj_head: bool = True,
-                 supcon_soft_pos: bool = False,
-                 supcon_soft_pos_tau: float = 0.1,
-                 supcon_denom_pos_weight: bool = False,
-                 taxocon_aug: bool = False,
-                 sinkhorn: bool = False,
-                 sinkhorn_iters: int = 5,
                  grad_checkpointing: bool = False,
                  num_classes: Optional[int] = None,
-                 cross_entropy: bool = False,
+                 aux_classifier: bool = False,
                  grafit_predictor: bool = False,
                  use_hpa: bool = False,
                  hpa_heads: int = 1,
@@ -131,11 +123,11 @@ class Backbone(nn.Module):
         # Width of what forward() returns: the head is optional.
         self.output_dim = embedding_dim if self.use_proj_head else feat_dim
 
-        # Optional linear classifier for the supervised cross-entropy baseline.
+        # Linear classifier head used by BuCSFR's auxiliary cross-entropy term.
         # It sits on the same (normalized) embedding the contrastive losses use.
-        if cross_entropy:
+        if aux_classifier:
             if not num_classes or num_classes < 2:
-                raise ValueError("cross_entropy requires num_classes >= 2.")
+                raise ValueError("aux_classifier requires num_classes >= 2.")
             clf_in = embedding_dim if self.use_proj_head else feat_dim
             self.classifier = nn.Linear(clf_in, num_classes)
         else:
@@ -162,20 +154,6 @@ class Backbone(nn.Module):
             gamma=hpa_gamma,
             layernorm=hpa_layernorm,
         ) if use_hpa else None
-
-        self.supcon_soft_pos_loss = SupConSoftPosLoss(
-            pos_weight_tau=supcon_soft_pos_tau,
-            sinkhorn=sinkhorn,
-            sinkhorn_iters=sinkhorn_iters,
-            denom_pos_weight=supcon_denom_pos_weight,
-        ) if supcon_soft_pos else None
-
-        self.taxocon_aug_loss = TaxoConAugLoss(
-            pos_weight_tau=supcon_soft_pos_tau,
-            sinkhorn=sinkhorn,
-            sinkhorn_iters=sinkhorn_iters,
-            denom_pos_weight=supcon_denom_pos_weight,
-        ) if taxocon_aug else None
 
     def trainable_parameters(self) -> List[nn.Parameter]:
         """Return all trainable (backbone + projection head) parameters."""
@@ -214,34 +192,6 @@ class Backbone(nn.Module):
             prototypes = prototype_fn(z)
         return self.hpa(z, prototypes)
 
-    def loss_function(self, embeddings: Tensor, labels: Tensor,
-                      **kwargs) -> Dict[str, Tensor]:
-        kwargs.setdefault("temperature", self.temperature)
-        return vanilla_supcon_loss(embeddings, labels, **kwargs)
-
-    def supcon_soft_pos_loss_function(
-        self, embeddings: Tensor, labels: Tensor, **kwargs,
-    ) -> Dict[str, Tensor]:
-        kwargs.setdefault("temperature", self.temperature)
-        return self.supcon_soft_pos_loss(embeddings, labels, **kwargs)
-
-    def taxocon_aug_loss_function(
-        self, embeddings: Tensor, labels: Tensor, **kwargs,
-    ) -> Dict[str, Tensor]:
-        kwargs.setdefault("temperature", self.temperature)
-        return self.taxocon_aug_loss(embeddings, labels, **kwargs)
-
-    def vanilla_supcon_loss_function(
-        self, embeddings: Tensor, labels: Tensor, **kwargs,
-    ) -> Dict[str, Tensor]:
-        kwargs.setdefault("temperature", self.temperature)
-        return vanilla_supcon_loss(embeddings, labels, **kwargs)
-
-    def ms_loss_function(
-        self, embeddings: Tensor, labels: Tensor, **kwargs,
-    ) -> Dict[str, Tensor]:
-        return multi_similarity_loss(embeddings, labels, **kwargs)
-
     def grafit_predict(self, embeddings: Tensor) -> Tensor:
         """Normalized predictor output q(g(x)) for Grafit's instance term."""
         if self.grafit_predictor is None:
@@ -272,23 +222,10 @@ class Backbone(nn.Module):
         """Coarse-class logits, or None when the model has no classifier head."""
         return None if self.classifier is None else self.classifier(embeddings)
 
-    def ce_loss_function(
-        self, embeddings: Tensor, labels: Tensor, **kwargs,
+    def hpa_consistency_loss_function(
+        self, student_views: Tensor, teacher_views: Tensor, **kwargs,
     ) -> Dict[str, Tensor]:
-        if self.classifier is None:
-            raise RuntimeError(
-                "ce_loss_function requires the model to be built with "
-                "cross_entropy=True."
-            )
-        labels = labels.view(-1).long()
-        logits = self.classifier(embeddings)
-        loss = F.cross_entropy(logits, labels)
-        with torch.no_grad():
-            top1 = (logits.argmax(dim=1) == labels).float().mean()
-            k = min(5, logits.size(1))
-            top5 = (logits.topk(k, dim=1).indices
-                    == labels.unsqueeze(1)).any(dim=1).float().mean()
-        return {"loss": loss, "ce_top1": top1, "ce_top5": top5}
+        return hpa_consistency_loss(student_views, teacher_views, **kwargs)
 
     @staticmethod
     @torch.no_grad()
