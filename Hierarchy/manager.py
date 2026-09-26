@@ -15,6 +15,7 @@ must never be passed in or inspected here.
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence
 
+import os
 import sys
 
 import numpy as np
@@ -336,12 +337,18 @@ def progress_bar(iterable: Iterable, desc: str, disable: bool = False,
     """tqdm bar that stays readable in log files.
 
     Without a TTY every refresh emits a new line, so redirected runs get a
-    fixed-width bar updated at most every 30 s instead of once per item.
+    fixed-width bar printed at most once per ``HPA_PROGRESS_INTERVAL`` seconds
+    (default 30) instead of once per item.
     """
     tty = sys.stdout.isatty()
+    interval = float(os.environ.get("HPA_PROGRESS_INTERVAL", 30.0))
+    # The monitor thread would force an extra line between our own refreshes.
+    tqdm.monitor_interval = 0
     return tqdm(iterable, desc=desc, total=total, disable=disable,
                 file=sys.stdout, leave=not tty, dynamic_ncols=tty,
-                ncols=None if tty else 80, mininterval=0.1 if tty else 30.0)
+                ncols=None if tty else 300,
+                mininterval=0.1 if tty else interval,
+                maxinterval=float("inf") if not tty else 10.0)
 
 
 def _nearest_rows_per_level(x: np.ndarray, prototypes: np.ndarray,
