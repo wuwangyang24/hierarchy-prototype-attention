@@ -152,8 +152,7 @@ class BestValLossReporter(Callback):
                 print(f"[report] skipped Excel workbook generation: {e}")
 
 from Models import Backbone
-from dataset import (ContrastiveDataModule, InatDataModule,
-                     FGVCAircraftDataModule)
+from dataset import InatDataModule, FGVCAircraftDataModule
 from experiment import ContrastiveExperiment
 
 # Use file-system based tensor sharing to avoid /dev/shm exhaustion, which
@@ -166,10 +165,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a contrastive backbone with PyTorch Lightning + W&B")
 
     # Data
-    parser.add_argument("--dataset", type=str, default="myzus",
-                        choices=["myzus", "inat", "aircraft"],
-                        help="Dataset to use: 'myzus' (default synthesis-program dataset), "
-                             "'inat' (iNaturalist 2021 mini) or 'aircraft' (FGVC-Aircraft)")
+    parser.add_argument("--dataset", type=str, default="inat",
+                        choices=["inat", "aircraft"],
+                        help="Dataset to use: 'inat' (iNaturalist 2021 mini) or "
+                             "'aircraft' (FGVC-Aircraft)")
     parser.add_argument("--train_cat", type=str, default="class",
                         help="Taxonomy level for contrastive training labels (inat only). "
                              "Options: kingdom, phylum, class, order, family, genus. "
@@ -205,7 +204,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=96, help="Square image size")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=12)
-    parser.add_argument("--val_split", type=float, default=0.1)
 
     # Model
     parser.add_argument("--model", type=str, default="backbone",
@@ -271,43 +269,7 @@ def parse_args() -> argparse.Namespace:
                              "offline analysis (see analyze_hierarchy.py). Disabled "
                              "by default.")
 
-    # Contrastive dataset (synthesis-program labels; only used when --model backbone)
-    parser.add_argument("--contrastive_metadata", type=str, nargs="+", default=None,
-                        help="JSON metadata (compounds -> plates -> image paths) for "
-                             "the contrastive dataset. Multiple files can be provided "
-                             "and will be merged. Required for --model backbone.")
-    parser.add_argument("--contrastive_labels", type=str, default=None,
-                        help="CSV/Excel mapping compounds to synthesis-program labels. "
-                             "Required for --model backbone.")
-    parser.add_argument("--contrastive_root_dir", type=str, default=None,
-                        help="Root directory prepended to image paths in the JSON. "
-                             "Required for --model backbone.")
-    parser.add_argument("--contrastive_compound_col", type=str, default="compound",
-                        help="Compound-ID column in the label CSV. Default: compound")
-    parser.add_argument("--contrastive_label_col", type=str, default="synthesis_program",
-                        help="Synthesis-program column in the label CSV. "
-                             "Default: synthesis_program")
-    parser.add_argument("--contrastive_min_per_class", type=int, default=2,
-                        help="Drop synthesis programs with fewer distinct compounds. "
-                             "Default: 2")
-    parser.add_argument("--contrastive_filter_efficacy", type=float, default=0,
-                        help="Keep only compounds with Efficacy >= this value")
-    parser.add_argument("--contrastive_use_control", action="store_true",
-                        help="Also include per-plate control images as training samples")
-    parser.add_argument("--contrastive_classes_per_batch", type=int, default=0,
-                        help="P for class-balanced P x K sampling: distinct synthesis "
-                             "programs per batch. When > 0 (with "
-                             "--contrastive_samples_per_class), guarantees positives and "
-                             "negatives in every batch; effective batch size = P * K "
-                             "(overrides --batch_size for training).")
-    parser.add_argument("--contrastive_samples_per_class", type=int, default=0,
-                        help="K for class-balanced P x K sampling: images per synthesis "
-                             "program per batch.")
-    parser.add_argument("--compound_level", action="store_true",
-                        help="Compute the contrastive loss at the compound level "
-                             "instead of the synthesis-program level: each compound "
-                             "becomes its own class, so positives are images of the "
-                             "same compound (across plates/replicates).")
+    # Losses
     parser.add_argument("--supcon_soft_pos_loss", action="store_true",
                         help="Use supervised contrastive (SupCon) loss with "
                              "similarity-weighted positives: positive pairs that are "
@@ -547,15 +509,13 @@ def main() -> None:
             img_size=args.img_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            classes_per_batch=args.contrastive_classes_per_batch,
-            samples_per_class=args.contrastive_samples_per_class,
             superclass=args.superclass,
             grafit_views=grafit_views,
             grafit_bank=grafit_bank,
             return_index=args.use_hpa,
             seed=args.seed,
         )
-    elif args.dataset == "aircraft":
+    else:
         # FGVC-Aircraft (manufacturer / family / variant hierarchy)
         datamodule = FGVCAircraftDataModule(
             root=args.aircraft_root,
@@ -566,43 +526,7 @@ def main() -> None:
             img_size=args.img_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            classes_per_batch=args.contrastive_classes_per_batch,
-            samples_per_class=args.contrastive_samples_per_class,
             download=args.aircraft_download,
-            grafit_views=grafit_views,
-            grafit_bank=grafit_bank,
-            return_index=args.use_hpa,
-            seed=args.seed,
-        )
-    else:
-        # Myzus (default) dataset
-        missing = [name for name, val in (
-            ("--contrastive_metadata", args.contrastive_metadata),
-            ("--contrastive_labels", args.contrastive_labels),
-            ("--contrastive_root_dir", args.contrastive_root_dir),
-        ) if not val]
-        if missing:
-            raise ValueError(
-                f"--model backbone requires {', '.join(missing)} to build the "
-                "synthesis-program-labelled contrastive dataset."
-            )
-
-        datamodule = ContrastiveDataModule(
-            image_metadata_json=args.contrastive_metadata,
-            label_metadata_csv=args.contrastive_labels,
-            root_dir=args.contrastive_root_dir,
-            img_size=args.img_size,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            val_split=args.val_split,
-            compound_col=args.contrastive_compound_col,
-            label_col=args.contrastive_label_col,
-            min_compounds_per_class=args.contrastive_min_per_class,
-            filter_by_efficacy=args.contrastive_filter_efficacy,
-            use_control=args.contrastive_use_control,
-            classes_per_batch=args.contrastive_classes_per_batch,
-            samples_per_class=args.contrastive_samples_per_class,
-            compound_level=args.compound_level,
             grafit_views=grafit_views,
             grafit_bank=grafit_bank,
             return_index=args.use_hpa,
@@ -620,9 +544,7 @@ def main() -> None:
         grafit_bank_size = (len(datamodule.train_dataset)
                             if (args.grafit and args.grafit_bank) else 0)
     if args.cross_entropy or args.bucsfr:
-        num_classes = (datamodule.num_train_classes
-                       if args.dataset in ("inat", "aircraft")
-                       else datamodule.num_classes)
+        num_classes = datamodule.num_train_classes
 
     model = Backbone(
         backbone=args.backbone,
@@ -705,16 +627,13 @@ def main() -> None:
 
     # Build checkpoint suffix (also used as default W&B run name).
     proj_tag = "Proj" if args.use_proj_head else "NoProj"
-    p_val = args.contrastive_classes_per_batch
-    k_val = args.contrastive_samples_per_class
-    level_tag = "_Comp" if args.compound_level else ""
     test_cat_tag = "-".join(args.test_cat)
     dataset_tag = ""
     if args.dataset == "inat":
         dataset_tag = f"_inat_{args.train_cat}->{test_cat_tag}"
         if args.superclass:
             dataset_tag += f"_{args.superclass}"
-    elif args.dataset == "aircraft":
+    else:
         dataset_tag = f"_aircraft_{args.train_cat}->{test_cat_tag}"
     # "FFT" = full fine-tuning; short per-architecture tag.
     backbone_tag = {
@@ -770,10 +689,9 @@ def main() -> None:
     ) if args.taxocon_aug else ""
     ckpt_suffix = (
         f"{model_prefix}"
-        f"_P{p_val}_K{k_val}_BS{args.batch_size}"
+        f"_BS{args.batch_size}"
         f"_{proj_tag}"
         f"_T{args.temperature}"
-        f"{level_tag}"
         f"{vanilla_supcon_tag}"
         f"{ms_loss_tag}"
         f"{grafit_tag}"
@@ -858,10 +776,8 @@ def main() -> None:
     }.get(args.backbone, args.backbone)
     if args.dataset == "inat":
         dataset_folder = args.superclass or f"{args.train_cat}_to_{'-'.join(args.test_cat)}"
-    elif args.dataset == "aircraft":
-        dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
     else:
-        dataset_folder = args.dataset
+        dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
 
     callbacks.append(BestValLossReporter(
         pos_weight_tau=pos_weight_tau,

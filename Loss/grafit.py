@@ -12,8 +12,8 @@ The paper uses ``lam = 1`` (Appendix B.1: "we just sum up the two losses").
 ``L_knn(x_i, y_i) = -log sum_{y_j = y_i, j != i} p_ij`` and ``sigma = 0.05``.
 The candidates ``m_j`` come from a memory bank holding one embedding per
 training image, refreshed as ``m_i <- 1/2 (m_i + g(x_i))``
-(:class:`GrafitMemoryBank`). Without a bank the batch plays that role, so a
-P x K batch sampler matters.
+(:class:`GrafitMemoryBank`). Without a bank the batch plays that role, so
+batches must be large enough to contain same-class candidates.
 
 ``L_inst`` keeps the fine-grained information the coarse labels cannot express.
 It is BYOL-like (Eq. 1): a predictor ``q`` on the online branch regresses the
