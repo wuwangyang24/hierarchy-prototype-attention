@@ -346,7 +346,7 @@ def progress_bar(iterable: Iterable, desc: str, disable: bool = False,
     tqdm.monitor_interval = 0
     return tqdm(iterable, desc=desc, total=total, disable=disable,
                 file=sys.stdout, leave=not tty, dynamic_ncols=tty,
-                ncols=None if tty else 300,
+                ncols=None if tty else 80,
                 mininterval=0.1 if tty else interval,
                 maxinterval=float("inf") if not tty else 10.0)
 
