@@ -8,19 +8,19 @@ from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelChec
 from pytorch_lightning.loggers import WandbLogger
 
 
-class BestValLossReporter(Callback):
-    """Track the epoch with the lowest ``val_loss`` and, at the end of
-    training, print a table of the Recall@k / linear-probe metrics recorded at
-    that epoch."""
+class LastEpochReporter(Callback):
+    """Track the most recent validation epoch and, at the end of training,
+    print a table of the Recall@k / linear-probe metrics recorded at that
+    epoch."""
 
     def __init__(self, stats_dir: str, report_name: str) -> None:
         super().__init__()
         self.stats_dir = stats_dir
         self.report_name = report_name
-        self.best_val_loss = float("inf")
-        self.best_epoch = None
-        self.best_metrics: dict = {}
-        self.best_cophenetic: dict = {}
+        self.last_val_loss = float("nan")
+        self.last_epoch = None
+        self.last_metrics: dict = {}
+        self.last_cophenetic: dict = {}
 
     def on_validation_end(self, trainer, pl_module) -> None:
         # Use on_validation_end (not on_validation_epoch_end) so that the
@@ -33,29 +33,27 @@ class BestValLossReporter(Callback):
         val_loss = metrics.get("val_loss")
         if val_loss is None:
             return
-        val_loss = float(val_loss)
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self.best_epoch = int(trainer.current_epoch)
-            self.best_metrics = {
-                k: float(v)
-                for k, v in metrics.items()
-                if ("recall_at" in k or "knn_top" in k or "linprobe_top" in k)
-            }
-            self.best_cophenetic = {
-                k: float(v)
-                for k, v in metrics.items()
-                if "cophenetic" in k
-            }
+        self.last_val_loss = float(val_loss)
+        self.last_epoch = int(trainer.current_epoch)
+        self.last_metrics = {
+            k: float(v)
+            for k, v in metrics.items()
+            if ("recall_at" in k or "knn_top" in k or "linprobe_top" in k)
+        }
+        self.last_cophenetic = {
+            k: float(v)
+            for k, v in metrics.items()
+            if "cophenetic" in k
+        }
 
     def on_fit_end(self, trainer, pl_module) -> None:
-        if self.best_epoch is None:
+        if self.last_epoch is None:
             return
 
         # Group the recorded metrics by their label-set prefix so each row of
         # the table corresponds to one evaluation (e.g. val_test_phylum).
         prefixes = sorted({
-            k.rsplit("_", 2)[0] for k in self.best_metrics
+            k.rsplit("_", 2)[0] for k in self.last_metrics
         })
 
         def fmt(value):
@@ -67,12 +65,12 @@ class BestValLossReporter(Callback):
         for prefix in prefixes:
             rows.append([
                 prefix,
-                fmt(self.best_metrics.get(f"{prefix}_recall_at1")),
-                fmt(self.best_metrics.get(f"{prefix}_recall_at5")),
-                fmt(self.best_metrics.get(f"{prefix}_knn_top1")),
-                fmt(self.best_metrics.get(f"{prefix}_knn_top5")),
-                fmt(self.best_metrics.get(f"{prefix}_linprobe_top1")),
-                fmt(self.best_metrics.get(f"{prefix}_linprobe_top5")),
+                fmt(self.last_metrics.get(f"{prefix}_recall_at1")),
+                fmt(self.last_metrics.get(f"{prefix}_recall_at5")),
+                fmt(self.last_metrics.get(f"{prefix}_knn_top1")),
+                fmt(self.last_metrics.get(f"{prefix}_knn_top5")),
+                fmt(self.last_metrics.get(f"{prefix}_linprobe_top1")),
+                fmt(self.last_metrics.get(f"{prefix}_linprobe_top5")),
             ])
 
         widths = [
@@ -86,7 +84,7 @@ class BestValLossReporter(Callback):
         lines = [
             "",
             "=" * max(60, sum(widths) + 3 * (len(widths) - 1)),
-            f"Best val_loss: {self.best_val_loss:.6f} @ epoch {self.best_epoch}",
+            f"Last val_loss: {self.last_val_loss:.6f} @ epoch {self.last_epoch}",
             "-" * max(60, sum(widths) + 3 * (len(widths) - 1)),
         ]
         if rows:
@@ -95,14 +93,14 @@ class BestValLossReporter(Callback):
             lines.extend(render(r) for r in rows)
         else:
             lines.append("(no Recall@k / kNN / linear-probe metrics were recorded)")
-        if self.best_cophenetic:
+        if self.last_cophenetic:
             width = max(60, sum(widths) + 3 * (len(widths) - 1))
             lines.append("-" * width)
             lines.append("Cophenetic correlation (embeddings vs. taxonomy):")
-            lines.append(f"  Spearman:   {fmt(self.best_cophenetic.get('val_cophenetic_spearman'))}")
-            lines.append(f"  Pearson:    {fmt(self.best_cophenetic.get('val_cophenetic_pearson'))}")
-            lines.append(f"  CPCC:       {fmt(self.best_cophenetic.get('val_cophenetic_cpcc'))}")
-            lines.append(f"  Dendro-Tax: {fmt(self.best_cophenetic.get('val_cophenetic_dendro_tax'))}")
+            lines.append(f"  Spearman:   {fmt(self.last_cophenetic.get('val_cophenetic_spearman'))}")
+            lines.append(f"  Pearson:    {fmt(self.last_cophenetic.get('val_cophenetic_pearson'))}")
+            lines.append(f"  CPCC:       {fmt(self.last_cophenetic.get('val_cophenetic_cpcc'))}")
+            lines.append(f"  Dendro-Tax: {fmt(self.last_cophenetic.get('val_cophenetic_dendro_tax'))}")
         lines.append("=" * max(60, sum(widths) + 3 * (len(widths) - 1)))
         lines.append("")
         report = "\n".join(lines)
@@ -123,7 +121,7 @@ class BestValLossReporter(Callback):
                 report_paths = [
                     os.path.join(self.stats_dir, f)
                     for f in os.listdir(self.stats_dir)
-                    if f.endswith("_best_val_loss_report.txt")
+                    if f.endswith("_last_epoch_report.txt")
                 ]
                 by_kind = collect_dataset(report_paths)
                 if by_kind:
@@ -623,7 +621,13 @@ def main() -> None:
     callbacks = [lr_monitor]
 
     # Keep the last epoch's checkpoint (last.ckpt) for all models.
-    callbacks.append(ModelCheckpoint(dirpath=ckpt_dir, save_last=True, save_top_k=0))
+    callbacks.append(ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="last",
+        save_last=True,
+        save_top_k=0,
+        save_on_train_epoch_end=True,
+    ))
 
     # Also keep the checkpoint with the lowest validation loss.
     callbacks.append(ModelCheckpoint(
@@ -634,8 +638,7 @@ def main() -> None:
         save_top_k=1,
     ))
 
-    # Report the best-val-loss epoch's metrics as a table at the end of
-    # training.
+    # Report the last epoch's metrics as a table at the end of training.
     # Organise reports under <model>/<dataset>/ (e.g. resnet18/mammals/).
     model_folder = {
         "resnet18": "resnet18",
@@ -648,9 +651,9 @@ def main() -> None:
     else:
         dataset_folder = f"aircraft_{args.train_cat}_to_{'-'.join(args.test_cat)}"
 
-    callbacks.append(BestValLossReporter(
+    callbacks.append(LastEpochReporter(
         stats_dir=os.path.join(args.output_dir, "reports", model_folder, dataset_folder),
-        report_name=f"{ckpt_suffix}_best_val_loss_report.txt",
+        report_name=f"{ckpt_suffix}_last_epoch_report.txt",
     ))
 
     # Trainer
